@@ -115,3 +115,42 @@ class SequentialChain:
             context[chain.output_key] = result
 
         return context
+
+
+class RetrievalChain:
+    """
+    检索 + 生成链：query → 检索 → 拼入 prompt → LLM 生成。
+    """
+
+    def __init__(
+        self,
+        retriever: Any,
+        prompt: PromptTemplate,
+        llm: BaseLLM,
+        output_parser: BaseOutputParser | None = None,
+        k: int = 4,
+    ):
+        self._retriever = retriever
+        self._prompt = prompt
+        self._llm = llm
+        self._output_parser = output_parser or StrOutputParser()
+        self._k = k
+
+    def invoke(self, inputs: dict[str, Any]) -> Any:
+        query = inputs.get("question", "")
+
+        # 1. 检索相关文档
+        docs = self._retriever.search(query, k=self._k)
+        context = "\n".join(doc.page_content for doc in docs)
+
+        # 2. 填入 prompt
+        full_inputs = dict(inputs)
+        full_inputs["context"] = context
+
+        formatted = self._prompt.format(**full_inputs)
+
+        # 3. LLM 生成
+        llm_output = self._llm.invoke(formatted)
+
+        # 4. 解析输出
+        return self._output_parser.parse(llm_output)
