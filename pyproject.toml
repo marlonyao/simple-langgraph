@@ -4,8 +4,8 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "simple-langgraph"
-version = "0.1.0"
-description = "A simplified LangGraph implementation for learning"
+version = "0.2.0"
+description = "Simplified LangGraph + LangChain implementations for learning"
 requires-python = ">=3.10"
 
 [tool.pytest.ini_options]
