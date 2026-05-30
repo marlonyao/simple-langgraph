@@ -9,6 +9,7 @@ Simple LangGraph — 一个简化版 LangGraph 实现
 - 条件边：根据路由函数和 state 动态选择下一个节点
 - Reducer：自定义状态合并策略（如列表追加、取最大值）
 - Checkpointer：状态持久化，支持时间旅行（历史回溯）
+- Human-in-the-loop：断点暂停 + 人工修改 + 恢复执行
 """
 
 from __future__ import annotations
@@ -76,6 +77,8 @@ class CompiledGraph:
     编译后的可执行图。
 
     由 StateGraph.compile() 产生，支持 invoke() 执行。
+    支持断点暂停（interrupt_before / interrupt_after）、
+    人工修改状态（update_state）、从断点恢复执行。
     """
 
     def __init__(
@@ -86,6 +89,8 @@ class CompiledGraph:
         reducers: dict[str, Callable],
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         checkpointer: Optional[BaseCheckpointSaver] = None,
+        interrupt_before: Optional[list[str]] = None,
+        interrupt_after: Optional[list[str]] = None,
     ) -> None:
         self._nodes = nodes
         self._adjacency = adjacency
@@ -93,33 +98,80 @@ class CompiledGraph:
         self._reducers = reducers
         self._max_iterations = max_iterations
         self._checkpointer = checkpointer
+        self._interrupt_before = set(interrupt_before or [])
+        self._interrupt_after = set(interrupt_after or [])
 
     def invoke(
         self,
-        input: dict[str, Any],
+        input: Optional[dict[str, Any]] = None,
         config: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """
-        执行图：从 START 开始，沿边依次执行节点，直到到达 END。
+        执行图：从 START 开始，沿边依次执行节点，直到到达 END 或断点。
 
-        如果配置了 checkpointer，每执行一个节点后保存 checkpoint。
-        config 必须包含 thread_id（当有 checkpointer 时）。
+        支持三种模式：
+        1. 首次执行：input 是初始 state 字典
+        2. 断点恢复：input 为 None，从 checkpoint 加载 state 继续
+        3. 无 checkpointer：普通执行，不需要 config
         """
-        state: dict[str, Any] = dict(input)
+        thread_id = self._get_thread_id(config)
 
-        # 有 checkpointer 时必须提供 thread_id
-        thread_id: Optional[str] = None
-        if self._checkpointer:
-            if not config or "thread_id" not in config:
-                raise ValueError(
-                    "A checkpointer is configured, but no thread_id was provided. "
-                    "Pass config={'thread_id': 'your-id'} to invoke()."
-                )
-            thread_id = config["thread_id"]
+        # ── 校验：有 checkpointer 且有 input 时必须提供 thread_id ──
+        if self._checkpointer and input is not None and not thread_id:
+            raise ValueError(
+                "A checkpointer is configured, but no thread_id was provided. "
+                "Pass config={'thread_id': 'your-id'} to invoke()."
+            )
 
-        current_nodes = self._adjacency.get(START, [])
+        # ── 判断是否为断点恢复 ──
+        # 有 checkpointer + 有 thread_id + 有已有 checkpoint → 恢复
+        # 不管 input 是 None 还是非 None，都忽略 input，用 checkpoint 的 state
+        is_resume = False
+        saved_resume = None
+        if self._checkpointer and thread_id:
+            cp = self._checkpointer.load(thread_id)
+            if cp is not None:
+                is_resume = True
+                saved_resume = cp["metadata"].get("resume_node")
+                saved_resume_from = cp["metadata"].get("resume_from")
 
+        # ── 确定初始 state ──
+        if is_resume:
+            cp = self._checkpointer.load(thread_id)
+            state: dict[str, Any] = dict(cp["state"])
+        elif input is not None:
+            state = dict(input)
+        else:
+            state = {}
+
+        # ── 决定从哪个节点开始 ──
+        skip_interrupt_before_once = None  # 跳过哪个节点的 interrupt_before
+        if is_resume and saved_resume:
+            if saved_resume == END:
+                return state
+
+            # interrupt_before 的恢复：记录了 resume_from（上一个节点）
+            # 需要重新从该节点路由，这样人工修改 state 后路由结果会变
+            if saved_resume_from:
+                current_nodes = self._resolve_next(saved_resume_from, state)
+                # 路由结果可能直接到 END
+                if not current_nodes or current_nodes[0] == END:
+                    return state
+                # 跳过新目标节点的 interrupt_before（这次是恢复执行，不是首次到达）
+                skip_interrupt_before_once = current_nodes[0]
+            else:
+                # interrupt_after 的恢复：直接从 resume_node 开始执行
+                current_nodes = [saved_resume]
+                skip_interrupt_before_once = saved_resume
+        elif is_resume and not saved_resume:
+            # 有 checkpoint 但没有断点标记 → 上次已执行完毕
+            return state
+        else:
+            current_nodes = self._adjacency.get(START, [])
+
+        # ── 执行循环 ──
         iterations = 0
+        prev_node_name: Optional[str] = None
         while current_nodes:
             if iterations >= self._max_iterations:
                 raise RuntimeError(
@@ -129,30 +181,102 @@ class CompiledGraph:
 
             next_node_name = current_nodes[0]
 
+            # 到达 END → 结束
             if next_node_name == END:
                 break
 
+            # interrupt_before：在这个节点执行前暂停
+            if next_node_name in self._interrupt_before and next_node_name != skip_interrupt_before_once:
+                if self._checkpointer and thread_id:
+                    self._checkpointer.save(
+                        thread_id, state,
+                        metadata={
+                            "node": next_node_name,
+                            "step": iterations,
+                            "interrupt": "before",
+                            "resume_node": next_node_name,
+                            "resume_from": prev_node_name,
+                        },
+                    )
+                return state
+
+            # 清除跳过标志
+            skip_interrupt_before_once = None
+
+            # 执行节点
             node = self._nodes[next_node_name]
             updates = node.action(state)
             _merge_state(state, updates, self._reducers)
 
-            # 保存 checkpoint
+            # interrupt_after：在这个节点执行后暂停
+            if next_node_name in self._interrupt_after:
+                if self._checkpointer and thread_id:
+                    successors = self._resolve_next(next_node_name, state)
+                    resume_node = successors[0] if successors else END
+                    self._checkpointer.save(
+                        thread_id, state,
+                        metadata={
+                            "node": next_node_name,
+                            "step": iterations,
+                            "interrupt": "after",
+                            "resume_node": resume_node,
+                        },
+                    )
+                return state
+
+            # 保存 checkpoint（非断点的常规保存）
             if self._checkpointer and thread_id:
                 self._checkpointer.save(
-                    thread_id, state, metadata={"node": next_node_name, "step": iterations}
+                    thread_id, state,
+                    metadata={"node": next_node_name, "step": iterations},
                 )
 
             current_nodes = self._resolve_next(next_node_name, state)
+            prev_node_name = next_node_name
             iterations += 1
 
         return state
 
-    def get_state(self, config: dict[str, Any]) -> Optional[dict[str, Any]]:
+    def update_state(
+        self,
+        config: dict[str, Any],
+        values: dict[str, Any],
+    ) -> None:
         """
-        获取最新的 checkpoint state。
+        人工修改当前 checkpoint 的 state。
 
-        返回 state 字典，如果没有 checkpointer 或没有数据则返回 None。
+        只能在有 checkpointer 时使用。
+        修改后，下次 invoke(None, config) 会用修改后的 state 继续。
         """
+        if not self._checkpointer:
+            raise ValueError(
+                "Cannot update state: no checkpointer is configured. "
+                "Pass a checkpointer to compile() first."
+            )
+
+        thread_id = config.get("thread_id")
+        if not thread_id:
+            raise ValueError(
+                "Cannot update state: no thread_id provided in config."
+            )
+
+        cp = self._checkpointer.load(thread_id)
+        if cp is None:
+            raise ValueError(
+                f"No checkpoint found for thread_id '{thread_id}'. "
+                "Run invoke() first to create an initial checkpoint."
+            )
+
+        # 加载已有 state，合并人工修改，重新保存
+        state = dict(cp["state"])
+        _merge_state(state, values, self._reducers)
+
+        # 保留原有 metadata（特别是 resume_node）
+        metadata = dict(cp["metadata"])
+        self._checkpointer.save(thread_id, state, metadata=metadata)
+
+    def get_state(self, config: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """获取最新的 checkpoint state。"""
         if not self._checkpointer:
             return None
 
@@ -166,11 +290,7 @@ class CompiledGraph:
         return cp["state"]
 
     def get_state_history(self, config: dict[str, Any]) -> list[dict[str, Any]]:
-        """
-        获取所有历史 state（最新在前）。
-
-        返回 state 字典列表，用于时间旅行。
-        """
+        """获取所有历史 state（最新在前）。"""
         if not self._checkpointer:
             return []
 
@@ -180,6 +300,25 @@ class CompiledGraph:
 
         history = self._checkpointer.list_history(thread_id)
         return [h["state"] for h in history]
+
+    # ─── 内部辅助方法 ─────────────────────────────────────────────
+
+    def _get_thread_id(self, config: Optional[dict[str, Any]]) -> Optional[str]:
+        """从 config 中提取 thread_id。"""
+        if not config:
+            return None
+        return config.get("thread_id")
+
+    def _load_resume_node(self, thread_id: str) -> Optional[str]:
+        """
+        从最新的 checkpoint metadata 中读取 resume_node。
+
+        resume_node 是断点暂停时记录的"下次恢复应该执行的节点"。
+        """
+        cp = self._checkpointer.load(thread_id)  # type: ignore
+        if cp is None:
+            return None
+        return cp["metadata"].get("resume_node")
 
     def _resolve_next(self, node_name: str, state: dict) -> list[str]:
         """
@@ -231,9 +370,12 @@ class StateGraph:
         from operator import add
         graph = StateGraph(schema={"items": (list, add)})
 
-    带 checkpointer：
+    带 checkpointer + 断点：
         from simple_langgraph.checkpoint import MemorySaver
-        app = graph.compile(checkpointer=MemorySaver())
+        app = graph.compile(
+            checkpointer=MemorySaver(),
+            interrupt_before=["approve"],
+        )
         result = app.invoke({"key": "value"}, config={"thread_id": "t1"})
     """
 
@@ -284,14 +426,18 @@ class StateGraph:
     def compile(
         self,
         checkpointer: Optional[BaseCheckpointSaver] = None,
+        interrupt_before: Optional[list[str]] = None,
+        interrupt_after: Optional[list[str]] = None,
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
     ) -> CompiledGraph:
         """
-        编译图：验证结构 + 构建邻接表 + 注册条件边。
+        编译图：验证结构 + 构建邻接表 + 注册条件边 + 配置断点。
 
         参数：
-          checkpointer: 可选的状态持久化后端（如 MemorySaver）
-          max_iterations: 最大执行步数，防止无限循环（默认 100）
+          checkpointer: 可选的状态持久化后端
+          interrupt_before: 在这些节点执行前暂停
+          interrupt_after: 在这些节点执行后暂停
+          max_iterations: 最大执行步数，防止无限循环
         """
         # 检查 1：必须有 START 出边
         start_edges = [e for e in self._edges if e.src == START]
@@ -358,4 +504,6 @@ class StateGraph:
             reducers=self._reducers,
             max_iterations=max_iterations,
             checkpointer=checkpointer,
+            interrupt_before=interrupt_before,
+            interrupt_after=interrupt_after,
         )
