@@ -28,11 +28,13 @@ class LLMChain:
         llm: BaseLLM,
         output_parser: BaseOutputParser | None = None,
         output_key: str = "text",
+        memory: Any | None = None,
     ):
         self.prompt = prompt
         self.llm = llm
         self.output_parser = output_parser or StrOutputParser()
         self.output_key = output_key
+        self.memory = memory
 
     @property
     def input_keys(self) -> list[str]:
@@ -42,10 +44,21 @@ class LLMChain:
     def invoke(self, inputs: dict[str, Any]) -> Any:
         """
         执行链：
-        1. 用 inputs 填充 prompt 模板
-        2. 调用 LLM
-        3. 解析输出
+        1. 注入记忆到 inputs（如有 memory）
+        2. 用 inputs 填充 prompt 模板
+        3. 调用 LLM
+        4. 解析输出
+        5. 保存到 memory（如有 memory）
         """
+        # 注入记忆
+        if self.memory:
+            history = self.memory.load_memory()
+            history_str = "\n".join(
+                f"{m['role']}: {m['content']}" for m in history
+            )
+            inputs = dict(inputs)
+            inputs["history"] = history_str
+
         # 1. 格式化 prompt
         formatted = self.prompt.format(**inputs)
 
@@ -53,7 +66,14 @@ class LLMChain:
         llm_output = self.llm.invoke(formatted)
 
         # 3. 解析输出
-        return self.output_parser.parse(llm_output)
+        result = self.output_parser.parse(llm_output)
+
+        # 4. 保存到 memory
+        if self.memory:
+            human_input = inputs.get("input", "")
+            self.memory.save_context(human_input, str(result))
+
+        return result
 
     def batch(self, inputs_list: list[dict[str, Any]]) -> list[Any]:
         """批量调用：对每个输入执行 invoke"""
