@@ -11,6 +11,7 @@ Simple LangGraph — 一个简化版 LangGraph 实现
 - Checkpointer：状态持久化，支持时间旅行（历史回溯）
 - Human-in-the-loop：断点暂停 + 人工修改 + 恢复执行
 - Streaming：流式输出，支持 values 和 updates 两种模式
+- 并行执行：扇出/扇入，DAG 波次执行引擎
 """
 
 from __future__ import annotations
@@ -81,7 +82,7 @@ class CompiledGraph:
     由 StateGraph.compile() 产生。
     - invoke(): 一次性执行完，返回最终 state
     - stream(): 生成器，每执行一个节点 yield 一次
-    支持断点暂停、人工修改状态、流式输出。
+    支持并行扇出/扇入、断点暂停、人工修改状态、流式输出。
     """
 
     def __init__(
@@ -90,6 +91,7 @@ class CompiledGraph:
         adjacency: dict[str, list[str]],
         conditional: dict[str, ConditionalEdge],
         reducers: dict[str, Callable],
+        incoming_count: dict[str, int],
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         checkpointer: Optional[BaseCheckpointSaver] = None,
         interrupt_before: Optional[list[str]] = None,
@@ -99,6 +101,7 @@ class CompiledGraph:
         self._adjacency = adjacency
         self._conditional = conditional
         self._reducers = reducers
+        self._incoming_count = incoming_count
         self._max_iterations = max_iterations
         self._checkpointer = checkpointer
         self._interrupt_before = set(interrupt_before or [])
@@ -152,26 +155,28 @@ class CompiledGraph:
         yield_updates: bool = False,
     ) -> Generator[tuple, dict[str, Any], None]:
         """
-        内部执行引擎：invoke 和 stream 的共享逻辑。
+        内部执行引擎：基于波次的 DAG 执行。
+
+        每个波次（wave）中的节点可以并行执行（当前实现为顺序执行）。
+        支持扇出（一个节点 → 多个后继）和扇入（多个前驱 → 一个节点）。
+        扇入通过 barrier 机制实现：只有所有前驱都完成后，后继节点才变为就绪。
 
         yield 元组：
         - ("value", state_dict) — 节点执行后的完整 state
-        - ("update", node_name, updates_dict) — 节点返回的增量（仅 yield_updates=True 时）
-
-        返回值通过 Generator 的 send 不使用（统一用 yield）。
+        - ("update", node_name, updates_dict) — 节点返回的增量
         """
         thread_id = self._get_thread_id(config)
 
-        # ── 校验：有 checkpointer 且有 input 时必须提供 thread_id ──
+        # ── 校验 ──
         if self._checkpointer and input is not None and not thread_id:
             raise ValueError(
                 "A checkpointer is configured, but no thread_id was provided. "
                 "Pass config={'thread_id': 'your-id'} to invoke()."
             )
 
-        # ── 判断是否为断点恢复 ──
+        # ── 断点恢复判断 ──
         is_resume = False
-        saved_resume = None
+        saved_resume: Optional[str] = None
         saved_resume_from: Optional[str] = None
         if self._checkpointer and thread_id:
             cp = self._checkpointer.load(thread_id)
@@ -197,111 +202,152 @@ class CompiledGraph:
                 return
 
             if saved_resume_from:
-                current_nodes = self._resolve_next(saved_resume_from, state)
-                if not current_nodes or current_nodes[0] == END:
+                next_nodes = self._resolve_next(saved_resume_from, state)
+                if not next_nodes or next_nodes[0] == END:
                     yield ("value", state)
                     return
-                skip_interrupt_before_once = current_nodes[0]
+                skip_interrupt_before_once = next_nodes[0]
+                # 恢复时只执行路由目标这一个节点
+                ready: list[str] = [next_nodes[0]]
             else:
-                current_nodes = [saved_resume]
+                ready = [saved_resume]
                 skip_interrupt_before_once = saved_resume
         elif is_resume and not saved_resume:
             yield ("value", state)
             return
         else:
-            current_nodes = self._adjacency.get(START, [])
+            raw_start = list(self._adjacency.get(START, []))
+            ready = [n for n in raw_start if n != END]
 
-        # ── 执行循环 ──
+        # ── 波次执行 ──
+        # barrier: 追踪每个节点有多少前驱已完成
+        # incoming_count 记录了每个节点需要的入边数（不含 START）
+        barrier: dict[str, int] = {}  # node → 已完成的前驱数
+        wave_executed: set[str] = set()  # 当前波次已执行（防止同波次重复）
         iterations = 0
-        prev_node_name: Optional[str] = None
-        while current_nodes:
+
+        while ready:
             if iterations >= self._max_iterations:
                 raise RuntimeError(
                     f"Graph execution exceeded maximum iterations ({self._max_iterations}). "
                     "This likely indicates an infinite loop in your graph."
                 )
 
-            next_node_name = current_nodes[0]
+            # ── 执行当前波次的所有节点 ──
+            wave_updates: list[tuple[str, dict[str, Any]]] = []
+            wave_executed.clear()  # 清空当前波次已执行集合
 
-            # 到达 END → 结束
-            if next_node_name == END:
-                break
+            for node_name in ready:
+                # interrupt_before 检查
+                if node_name in self._interrupt_before and node_name != skip_interrupt_before_once:
+                    if self._checkpointer and thread_id:
+                        # 找到这个节点的前驱（用于 resume_from）
+                        prev = self._find_predecessor(node_name, state, ready)
+                        self._checkpointer.save(
+                            thread_id, state,
+                            metadata={
+                                "node": node_name,
+                                "step": iterations,
+                                "interrupt": "before",
+                                "resume_node": node_name,
+                                "resume_from": prev,
+                            },
+                        )
+                    yield ("value", state)
+                    return
 
-            # interrupt_before：在这个节点执行前暂停
-            if next_node_name in self._interrupt_before and next_node_name != skip_interrupt_before_once:
-                if self._checkpointer and thread_id:
-                    self._checkpointer.save(
-                        thread_id, state,
-                        metadata={
-                            "node": next_node_name,
-                            "step": iterations,
-                            "interrupt": "before",
-                            "resume_node": next_node_name,
-                            "resume_from": prev_node_name,
-                        },
-                    )
-                yield ("value", state)
-                return
-
-            # 清除跳过标志
+            # 清除 skip 标志
             skip_interrupt_before_once = None
 
-            # 执行节点
-            node = self._nodes[next_node_name]
-            updates = node.action(state)
+            # 执行波次中的每个节点
+            for node_name in ready:
+                node = self._nodes[node_name]
+                updates = node.action(state)
 
-            # yield updates（stream updates 模式需要）
-            if yield_updates:
-                yield ("update", next_node_name, dict(updates))
+                if yield_updates:
+                    yield ("update", node_name, dict(updates))
 
-            _merge_state(state, updates, self._reducers)
+                _merge_state(state, updates, self._reducers)
+                wave_updates.append((node_name, dict(updates)))
+                wave_executed.add(node_name)
 
-            # interrupt_after：在这个节点执行后暂停
-            if next_node_name in self._interrupt_after:
+                # interrupt_after 检查
+                if node_name in self._interrupt_after:
+                    if self._checkpointer and thread_id:
+                        successors = self._resolve_next(node_name, state)
+                        resume_node = successors[0] if successors else END
+                        self._checkpointer.save(
+                            thread_id, state,
+                            metadata={
+                                "node": node_name,
+                                "step": iterations,
+                                "interrupt": "after",
+                                "resume_node": resume_node,
+                            },
+                        )
+                    yield ("value", state)
+                    return
+
+                # 保存 checkpoint
                 if self._checkpointer and thread_id:
-                    successors = self._resolve_next(next_node_name, state)
-                    resume_node = successors[0] if successors else END
                     self._checkpointer.save(
                         thread_id, state,
-                        metadata={
-                            "node": next_node_name,
-                            "step": iterations,
-                            "interrupt": "after",
-                            "resume_node": resume_node,
-                        },
+                        metadata={"node": node_name, "step": iterations},
                     )
-                yield ("value", state)
-                return
 
-            # 保存 checkpoint（非断点的常规保存）
-            if self._checkpointer and thread_id:
-                self._checkpointer.save(
-                    thread_id, state,
-                    metadata={"node": next_node_name, "step": iterations},
-                )
+                yield ("value", dict(state))
 
-            # yield value（stream values 模式 + invoke 都需要）
-            yield ("value", dict(state))
-
-            current_nodes = self._resolve_next(next_node_name, state)
-            prev_node_name = next_node_name
             iterations += 1
 
-        # 循环正常结束（到达 END 或没有后续节点）
-        # 不需要额外 yield，上面循环中已经 yield 了每个节点的 value
-        # invoke() 会用空 dict 作为默认值
+            # ── 计算下一波次的就绪节点 ──
+            next_ready: list[str] = []
+            for node_name, _ in wave_updates:
+                successors = self._resolve_next(node_name, state)
+                for succ in successors:
+                    if succ == END:
+                        continue
+                    barrier[succ] = barrier.get(succ, 0) + 1
+                    required = self._incoming_count.get(succ, 0)
+                    # 条件边的目标（required=0）直接就绪，不受 wave_executed 限制
+                    # 固定边的目标需要所有前驱完成，且不在当前波次已执行列表里
+                    if required == 0:
+                        if succ not in next_ready:
+                            next_ready.append(succ)
+                    elif barrier[succ] >= required and succ not in wave_executed:
+                        if succ not in next_ready:
+                            next_ready.append(succ)
+
+            ready = next_ready
+
+    def _find_predecessor(
+        self, node_name: str, state: dict, current_wave: list[str]
+    ) -> Optional[str]:
+        """
+        找到 node_name 的前驱节点名（用于 interrupt_before 的 resume_from）。
+        查找固定边邻接表和条件边。
+        """
+        # 查固定边
+        for src, dsts in self._adjacency.items():
+            if node_name in dsts:
+                return src
+        # 查条件边：需要尝试哪个条件边的路由会指向 node_name
+        for src, cond in self._conditional.items():
+            try:
+                result = cond.path_fn(state)
+                if cond.path_map and result in cond.path_map:
+                    result = cond.path_map[result]
+                if result == node_name:
+                    return src
+            except Exception:
+                pass
+        return None
 
     def update_state(
         self,
         config: dict[str, Any],
         values: dict[str, Any],
     ) -> None:
-        """
-        人工修改当前 checkpoint 的 state。
-
-        只能在有 checkpointer 时使用。
-        修改后，下次 invoke(None, config) 会用修改后的 state 继续。
-        """
+        """人工修改当前 checkpoint 的 state。"""
         if not self._checkpointer:
             raise ValueError(
                 "Cannot update state: no checkpointer is configured. "
@@ -355,7 +401,6 @@ class CompiledGraph:
     # ─── 内部辅助方法 ─────────────────────────────────────────────
 
     def _get_thread_id(self, config: Optional[dict[str, Any]]) -> Optional[str]:
-        """从 config 中提取 thread_id。"""
         if not config:
             return None
         return config.get("thread_id")
@@ -364,7 +409,7 @@ class CompiledGraph:
         """
         决定 node_name 执行完后去哪。
 
-        ① 如果有条件边 → 调用路由函数，可选 path_map 翻译，返回结果
+        ① 如果有条件边 → 调用路由函数，返回结果
         ② 否则走固定边邻接表
         """
         cond = self._conditional.get(node_name)
@@ -420,7 +465,13 @@ class StateGraph:
 
     流式输出：
         for chunk in app.stream({"key": "value"}):
-            print(chunk)  # 每个节点执行后的 state
+            print(chunk)
+
+    并行执行：
+        graph.add_edge("a", "b")
+        graph.add_edge("a", "c")   # a → [b, c] 扇出
+        graph.add_edge("b", "d")
+        graph.add_edge("c", "d")   # [b, c] → d 扇入
     """
 
     def __init__(self, schema: Optional[dict] = None) -> None:
@@ -473,13 +524,7 @@ class StateGraph:
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
     ) -> CompiledGraph:
         """
-        编译图：验证结构 + 构建邻接表 + 注册条件边 + 配置断点。
-
-        参数：
-          checkpointer: 可选的状态持久化后端
-          interrupt_before: 在这些节点执行前暂停
-          interrupt_after: 在这些节点执行后暂停
-          max_iterations: 最大执行步数，防止无限循环
+        编译图：验证结构 + 构建邻接表 + 计算入边数 + 配置断点。
         """
         start_edges = [e for e in self._edges if e.src == START]
         if not start_edges:
@@ -497,14 +542,23 @@ class StateGraph:
                 "Use one or the other, not both."
             )
 
+        # 构建固定边邻接表
         adjacency: dict[str, list[str]] = {}
         for edge in self._edges:
             adjacency.setdefault(edge.src, []).append(edge.dst)
 
+        # 计算每个节点的入边数（来自固定边，不含 START 的边）
+        incoming_count: dict[str, int] = {}
+        for edge in self._edges:
+            if edge.src != START and edge.dst != END:
+                incoming_count[edge.dst] = incoming_count.get(edge.dst, 0) + 1
+
+        # 构建条件边字典
         conditional: dict[str, ConditionalEdge] = {}
         for ce in self._conditional_edges:
             conditional[ce.src] = ce
 
+        # 可达性检查
         reachability: dict[str, list[str]] = {}
         for edge in self._edges:
             reachability.setdefault(edge.src, []).append(edge.dst)
@@ -539,6 +593,7 @@ class StateGraph:
             adjacency=adjacency,
             conditional=conditional,
             reducers=self._reducers,
+            incoming_count=incoming_count,
             max_iterations=max_iterations,
             checkpointer=checkpointer,
             interrupt_before=interrupt_before,
