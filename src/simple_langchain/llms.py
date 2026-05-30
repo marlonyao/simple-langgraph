@@ -2,10 +2,12 @@
 Simple LangChain — LLM 抽象层
 
 核心概念：
-- BaseLLM：抽象基类，定义 invoke / generate 接口
+- Usage：token 使用量统计
+- Generation：单次生成结果（含 usage）
+- LLMResult：批量调用结果（含聚合 usage）
+- BaseLLM：抽象基类，定义 invoke / invoke_full / generate 接口
 - FakeListLLM：测试用假模型，按预设列表返回结果
-- Generation / LLMResult：调用的输入输出数据结构
-- 回调机制：on_llm_start / on_llm_end / on_llm_error
+- 回调机制：on_llm_start / on_llm_end（传 Generation）/ on_llm_error
 """
 
 from abc import ABC, abstractmethod
@@ -14,10 +16,28 @@ from typing import Any, Callable
 
 
 @dataclass
+class Usage:
+    """Token 使用量统计"""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+    def __add__(self, other: "Usage") -> "Usage":
+        return Usage(
+            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
+            completion_tokens=self.completion_tokens + other.completion_tokens,
+        )
+
+
+@dataclass
 class Generation:
     """单次 LLM 生成的结果"""
     text: str
     prompt: str = ""
+    usage: Usage = field(default_factory=Usage)
 
 
 @dataclass
@@ -28,13 +48,21 @@ class LLMResult:
     def __iter__(self):
         return iter(self.generations)
 
+    @property
+    def total_usage(self) -> Usage:
+        """聚合所有 generation 的 usage"""
+        result = Usage()
+        for gen in self.generations:
+            result = result + gen.usage
+        return result
+
 
 class BaseLLM(ABC):
     """
     LLM 抽象基类。
 
     子类只需实现 _invoke(prompt) -> str，
-    invoke() 和 generate() 由基类提供，包含回调逻辑。
+    invoke()、invoke_full()、generate() 由基类提供，包含回调和 usage 逻辑。
     """
 
     def __init__(self, callbacks: dict[str, Callable] | None = None):
@@ -45,40 +73,70 @@ class BaseLLM(ABC):
         """子类实现：给定 prompt，返回生成的文本"""
         ...
 
+    def _estimate_tokens(self, text: str) -> int:
+        """
+        粗略估算 token 数。
+
+        真实场景由 API 服务端计算。这里用简单的空格分词模拟。
+        子类可以重写这个方法用更精确的 tokenizer。
+        """
+        if not text:
+            return 0
+        return len(text.split())
+
     def invoke(self, prompt: str) -> str:
         """
-        调用 LLM 生成回复。
+        调用 LLM 生成回复，返回文本字符串。
 
         触发回调：on_llm_start → _invoke → on_llm_end / on_llm_error
+        """
+        return self.invoke_full(prompt).text
+
+    def invoke_full(self, prompt: str) -> Generation:
+        """
+        调用 LLM 生成回复，返回完整的 Generation（含 usage）。
+
+        触发回调：on_llm_start → _invoke → on_llm_end / on_llm_error
+        on_llm_end 收到的是 Generation 对象（含 usage）。
         """
         # on_llm_start
         if "on_llm_start" in self._callbacks:
             self._callbacks["on_llm_start"](prompt)
 
         try:
-            result = self._invoke(prompt)
+            result_text = self._invoke(prompt)
         except Exception as e:
             # on_llm_error
             if "on_llm_error" in self._callbacks:
                 self._callbacks["on_llm_error"](e)
             raise
 
-        # on_llm_end
-        if "on_llm_end" in self._callbacks:
-            self._callbacks["on_llm_end"](result)
+        # 构建 Generation（含 usage）
+        generation = Generation(
+            text=result_text,
+            prompt=prompt,
+            usage=Usage(
+                prompt_tokens=self._estimate_tokens(prompt),
+                completion_tokens=self._estimate_tokens(result_text),
+            ),
+        )
 
-        return result
+        # on_llm_end：传 Generation 对象
+        if "on_llm_end" in self._callbacks:
+            self._callbacks["on_llm_end"](generation)
+
+        return generation
 
     def generate(self, prompts: list[str]) -> LLMResult:
         """
         批量调用：给定多个 prompt，返回 LLMResult。
 
-        内部循环调用 invoke()，每次都会触发回调。
+        内部循环调用 invoke_full()，每次都会触发回调。
         """
         generations = []
         for prompt in prompts:
-            text = self.invoke(prompt)
-            generations.append(Generation(text=text, prompt=prompt))
+            gen = self.invoke_full(prompt)
+            generations.append(gen)
         return LLMResult(generations=generations)
 
 

@@ -125,7 +125,8 @@ class TestCallbacks:
         )
         llm.invoke("test")
         assert len(calls) == 1
-        assert calls[0] == ("end", "hi")
+        assert calls[0][0] == "end"
+        assert calls[0][1].text == "hi"
 
     def test_on_llm_error_callback(self):
         """出错时触发 on_llm_error"""
