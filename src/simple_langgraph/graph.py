@@ -8,12 +8,16 @@ Simple LangGraph — 一个简化版 LangGraph 实现
 - 固定边：无条件从 A 走到 B
 - 条件边：根据路由函数和 state 动态选择下一个节点
 - Reducer：自定义状态合并策略（如列表追加、取最大值）
+- Checkpointer：状态持久化，支持时间旅行（历史回溯）
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from simple_langgraph.checkpoint import BaseCheckpointSaver
 
 # ─── 虚拟节点常量 ───────────────────────────────────────────────
 START = "__start__"
@@ -81,20 +85,38 @@ class CompiledGraph:
         conditional: dict[str, ConditionalEdge],
         reducers: dict[str, Callable],
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
+        checkpointer: Optional[BaseCheckpointSaver] = None,
     ) -> None:
         self._nodes = nodes
         self._adjacency = adjacency
         self._conditional = conditional
         self._reducers = reducers
         self._max_iterations = max_iterations
+        self._checkpointer = checkpointer
 
-    def invoke(self, input: dict[str, Any]) -> dict[str, Any]:
+    def invoke(
+        self,
+        input: dict[str, Any],
+        config: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
         """
         执行图：从 START 开始，沿边依次执行节点，直到到达 END。
 
-        支持循环（条件边回指之前的节点），有最大迭代保护。
+        如果配置了 checkpointer，每执行一个节点后保存 checkpoint。
+        config 必须包含 thread_id（当有 checkpointer 时）。
         """
         state: dict[str, Any] = dict(input)
+
+        # 有 checkpointer 时必须提供 thread_id
+        thread_id: Optional[str] = None
+        if self._checkpointer:
+            if not config or "thread_id" not in config:
+                raise ValueError(
+                    "A checkpointer is configured, but no thread_id was provided. "
+                    "Pass config={'thread_id': 'your-id'} to invoke()."
+                )
+            thread_id = config["thread_id"]
+
         current_nodes = self._adjacency.get(START, [])
 
         iterations = 0
@@ -114,10 +136,50 @@ class CompiledGraph:
             updates = node.action(state)
             _merge_state(state, updates, self._reducers)
 
+            # 保存 checkpoint
+            if self._checkpointer and thread_id:
+                self._checkpointer.save(
+                    thread_id, state, metadata={"node": next_node_name, "step": iterations}
+                )
+
             current_nodes = self._resolve_next(next_node_name, state)
             iterations += 1
 
         return state
+
+    def get_state(self, config: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """
+        获取最新的 checkpoint state。
+
+        返回 state 字典，如果没有 checkpointer 或没有数据则返回 None。
+        """
+        if not self._checkpointer:
+            return None
+
+        thread_id = config.get("thread_id")
+        if not thread_id:
+            return None
+
+        cp = self._checkpointer.load(thread_id)
+        if cp is None:
+            return None
+        return cp["state"]
+
+    def get_state_history(self, config: dict[str, Any]) -> list[dict[str, Any]]:
+        """
+        获取所有历史 state（最新在前）。
+
+        返回 state 字典列表，用于时间旅行。
+        """
+        if not self._checkpointer:
+            return []
+
+        thread_id = config.get("thread_id")
+        if not thread_id:
+            return []
+
+        history = self._checkpointer.list_history(thread_id)
+        return [h["state"] for h in history]
 
     def _resolve_next(self, node_name: str, state: dict) -> list[str]:
         """
@@ -168,6 +230,11 @@ class StateGraph:
     带 reducer：
         from operator import add
         graph = StateGraph(schema={"items": (list, add)})
+
+    带 checkpointer：
+        from simple_langgraph.checkpoint import MemorySaver
+        app = graph.compile(checkpointer=MemorySaver())
+        result = app.invoke({"key": "value"}, config={"thread_id": "t1"})
     """
 
     def __init__(self, schema: Optional[dict] = None) -> None:
@@ -214,11 +281,16 @@ class StateGraph:
             src=source, path_fn=path_fn, path_map=path_map
         ))
 
-    def compile(self, max_iterations: int = DEFAULT_MAX_ITERATIONS) -> CompiledGraph:
+    def compile(
+        self,
+        checkpointer: Optional[BaseCheckpointSaver] = None,
+        max_iterations: int = DEFAULT_MAX_ITERATIONS,
+    ) -> CompiledGraph:
         """
         编译图：验证结构 + 构建邻接表 + 注册条件边。
 
         参数：
+          checkpointer: 可选的状态持久化后端（如 MemorySaver）
           max_iterations: 最大执行步数，防止无限循环（默认 100）
         """
         # 检查 1：必须有 START 出边
@@ -285,4 +357,5 @@ class StateGraph:
             conditional=conditional,
             reducers=self._reducers,
             max_iterations=max_iterations,
+            checkpointer=checkpointer,
         )
