@@ -7,6 +7,7 @@ Simple LangGraph — 一个简化版 LangGraph 实现
 - START / END：虚拟节点，标识图的入口和出口
 - 固定边：无条件从 A 走到 B
 - 条件边：根据路由函数和 state 动态选择下一个节点
+- Reducer：自定义状态合并策略（如列表追加、取最大值）
 """
 
 from __future__ import annotations
@@ -17,6 +18,29 @@ from typing import Any, Callable, Optional
 # ─── 虚拟节点常量 ───────────────────────────────────────────────
 START = "__start__"
 END = "__end__"
+
+# ─── 默认最大迭代次数 ──────────────────────────────────────────
+DEFAULT_MAX_ITERATIONS = 100
+
+
+# ─── 状态合并辅助 ───────────────────────────────────────────────
+def _merge_state(
+    state: dict[str, Any],
+    updates: dict[str, Any],
+    reducers: dict[str, Callable],
+) -> None:
+    """
+    把 updates 合并到 state。
+
+    - 有 reducer 的 key：调用 reducer(old, new) 合并
+    - 没有 reducer 的 key：直接覆盖（last-writer-wins）
+    """
+    for key, new_val in updates.items():
+        if key in reducers:
+            old_val = state.get(key)
+            state[key] = reducers[key](old_val, new_val)
+        else:
+            state[key] = new_val
 
 
 # ─── 数据结构 ───────────────────────────────────────────────────
@@ -48,10 +72,6 @@ class CompiledGraph:
     编译后的可执行图。
 
     由 StateGraph.compile() 产生，支持 invoke() 执行。
-    内部维护：
-    - _nodes: 节点注册表
-    - _adjacency: 固定边邻接表 {节点名: [目标节点名列表]}
-    - _conditional: 条件边 {源节点名: ConditionalEdge}
     """
 
     def __init__(
@@ -59,23 +79,32 @@ class CompiledGraph:
         nodes: dict[str, Node],
         adjacency: dict[str, list[str]],
         conditional: dict[str, ConditionalEdge],
+        reducers: dict[str, Callable],
+        max_iterations: int = DEFAULT_MAX_ITERATIONS,
     ) -> None:
         self._nodes = nodes
         self._adjacency = adjacency
         self._conditional = conditional
+        self._reducers = reducers
+        self._max_iterations = max_iterations
 
     def invoke(self, input: dict[str, Any]) -> dict[str, Any]:
         """
         执行图：从 START 开始，沿边依次执行节点，直到到达 END。
 
-        对于每个节点，先检查有没有条件边：
-        - 有条件边 → 调用路由函数决定下一个节点
-        - 没有条件边 → 走固定边
+        支持循环（条件边回指之前的节点），有最大迭代保护。
         """
         state: dict[str, Any] = dict(input)
         current_nodes = self._adjacency.get(START, [])
 
+        iterations = 0
         while current_nodes:
+            if iterations >= self._max_iterations:
+                raise RuntimeError(
+                    f"Graph execution exceeded maximum iterations ({self._max_iterations}). "
+                    "This likely indicates an infinite loop in your graph."
+                )
+
             next_node_name = current_nodes[0]
 
             if next_node_name == END:
@@ -83,10 +112,10 @@ class CompiledGraph:
 
             node = self._nodes[next_node_name]
             updates = node.action(state)
-            state.update(updates)
+            _merge_state(state, updates, self._reducers)
 
-            # 查找下一个节点：条件边优先，否则走固定边
             current_nodes = self._resolve_next(next_node_name, state)
+            iterations += 1
 
         return state
 
@@ -100,7 +129,6 @@ class CompiledGraph:
         cond = self._conditional.get(node_name)
         if cond:
             raw = cond.path_fn(state)
-            # 如果有 path_map，翻译返回值
             if cond.path_map:
                 if raw in cond.path_map:
                     next_name = cond.path_map[raw]
@@ -113,7 +141,6 @@ class CompiledGraph:
             else:
                 next_name = raw
 
-            # 验证路由结果
             if next_name != END and next_name not in self._nodes:
                 raise ValueError(
                     f"Router for '{node_name}' returned '{next_name}', "
@@ -137,12 +164,24 @@ class StateGraph:
         graph.add_edge("name", END)
         app = graph.compile()
         result = app.invoke({"key": "value"})
+
+    带 reducer：
+        from operator import add
+        graph = StateGraph(schema={"items": (list, add)})
     """
 
-    def __init__(self) -> None:
+    def __init__(self, schema: Optional[dict] = None) -> None:
         self._nodes: dict[str, Node] = {}
         self._edges: list[Edge] = []
         self._conditional_edges: list[ConditionalEdge] = []
+        self._reducers: dict[str, Callable] = {}
+
+        # 解析 schema 中的 reducer
+        if schema is not None:
+            for key, spec in schema.items():
+                if isinstance(spec, tuple) and len(spec) == 2:
+                    # {"key": (type, reducer_func)}
+                    self._reducers[key] = spec[1]
 
     def add_node(self, name: str, action: Callable[[dict], dict]) -> None:
         """注册一个节点。name 是唯一标识，action 是接收 state 返回部分 state 的函数。"""
@@ -153,12 +192,7 @@ class StateGraph:
         self._nodes[name] = Node(name=name, action=action)
 
     def add_edge(self, src: str, dst: str) -> None:
-        """
-        添加一条固定边。
-
-        src/dst 可以是节点名、START、或 END。
-        如果引用了不存在的节点名（非 START/END），立即报错。
-        """
+        """添加一条固定边。"""
         if src not in (START, END) and src not in self._nodes:
             raise ValueError(f"Source node '{src}' does not exist")
         if dst not in (START, END) and dst not in self._nodes:
@@ -172,14 +206,7 @@ class StateGraph:
         path_fn: Callable[[dict], str],
         path_map: Optional[dict[str, str]] = None,
     ) -> None:
-        """
-        添加条件边。
-
-        参数：
-          source: 源节点名（条件边从哪个节点出发）
-          path_fn: 路由函数，接收 state，返回下一个节点名（或 path_map 的 key）
-          path_map: 可选映射表，把 path_fn 的返回值翻译成实际节点名
-        """
+        """添加条件边。"""
         if source not in (START, END) and source not in self._nodes:
             raise ValueError(f"Source node '{source}' does not exist")
 
@@ -187,14 +214,12 @@ class StateGraph:
             src=source, path_fn=path_fn, path_map=path_map
         ))
 
-    def compile(self) -> CompiledGraph:
+    def compile(self, max_iterations: int = DEFAULT_MAX_ITERATIONS) -> CompiledGraph:
         """
         编译图：验证结构 + 构建邻接表 + 注册条件边。
 
-        验证规则：
-        1. 必须有从 START 出发的边
-        2. 所有注册的节点必须可达
-        3. 一个节点不能同时有固定出边和条件出边
+        参数：
+          max_iterations: 最大执行步数，防止无限循环（默认 100）
         """
         # 检查 1：必须有 START 出边
         start_edges = [e for e in self._edges if e.src == START]
@@ -225,7 +250,6 @@ class StateGraph:
             conditional[ce.src] = ce
 
         # 检查 3：所有节点必须可达（BFS）
-        # 从 START 出发，沿固定边 + 有 path_map 的条件边做 BFS
         reachability: dict[str, list[str]] = {}
         for edge in self._edges:
             reachability.setdefault(edge.src, []).append(edge.dst)
@@ -242,7 +266,6 @@ class StateGraph:
                     reachable.add(next_node)
                     queue.append(next_node)
 
-        # 没有 path_map 的条件边无法静态分析目标，跳过孤立检查
         has_dynamic_cond = any(
             not ce.path_map and ce.src in (reachable | {START})
             for ce in self._conditional_edges
@@ -256,4 +279,10 @@ class StateGraph:
                     "Every node must have an incoming edge."
                 )
 
-        return CompiledGraph(nodes=self._nodes, adjacency=adjacency, conditional=conditional)
+        return CompiledGraph(
+            nodes=self._nodes,
+            adjacency=adjacency,
+            conditional=conditional,
+            reducers=self._reducers,
+            max_iterations=max_iterations,
+        )
