@@ -10,10 +10,12 @@ Simple LangGraph — 一个简化版 LangGraph 实现
 - Reducer：自定义状态合并策略（如列表追加、取最大值）
 - Checkpointer：状态持久化，支持时间旅行（历史回溯）
 - Human-in-the-loop：断点暂停 + 人工修改 + 恢复执行
+- Streaming：流式输出，支持 values 和 updates 两种模式
 """
 
 from __future__ import annotations
 
+from collections.abc import Generator
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
@@ -76,9 +78,10 @@ class CompiledGraph:
     """
     编译后的可执行图。
 
-    由 StateGraph.compile() 产生，支持 invoke() 执行。
-    支持断点暂停（interrupt_before / interrupt_after）、
-    人工修改状态（update_state）、从断点恢复执行。
+    由 StateGraph.compile() 产生。
+    - invoke(): 一次性执行完，返回最终 state
+    - stream(): 生成器，每执行一个节点 yield 一次
+    支持断点暂停、人工修改状态、流式输出。
     """
 
     def __init__(
@@ -108,11 +111,54 @@ class CompiledGraph:
     ) -> dict[str, Any]:
         """
         执行图：从 START 开始，沿边依次执行节点，直到到达 END 或断点。
+        返回最终（或断点处的）state。
+        """
+        final_state: dict[str, Any] = {}
+        for event in self._run(input, config):
+            if event[0] == "value":
+                final_state = event[1]
+        return final_state
 
-        支持三种模式：
-        1. 首次执行：input 是初始 state 字典
-        2. 断点恢复：input 为 None，从 checkpoint 加载 state 继续
-        3. 无 checkpointer：普通执行，不需要 config
+    def stream(
+        self,
+        input: Optional[dict[str, Any]] = None,
+        config: Optional[dict[str, Any]] = None,
+        *,
+        mode: str = "values",
+    ) -> Generator[dict[str, Any], None, None]:
+        """
+        流式执行图：每执行一个节点 yield 一次。
+
+        mode 参数：
+        - "values": yield 完整 state 快照（默认）
+        - "updates": yield {节点名: 节点返回的 updates}
+        """
+        if mode not in ("values", "updates"):
+            raise ValueError(
+                f"Unsupported stream mode: '{mode}'. "
+                "Use 'values' or 'updates'."
+            )
+
+        for event in self._run(input, config, yield_updates=(mode == "updates")):
+            if mode == "values" and event[0] == "value":
+                yield event[1]
+            elif mode == "updates" and event[0] == "update":
+                yield {event[1]: event[2]}
+
+    def _run(
+        self,
+        input: Optional[dict[str, Any]],
+        config: Optional[dict[str, Any]],
+        yield_updates: bool = False,
+    ) -> Generator[tuple, dict[str, Any], None]:
+        """
+        内部执行引擎：invoke 和 stream 的共享逻辑。
+
+        yield 元组：
+        - ("value", state_dict) — 节点执行后的完整 state
+        - ("update", node_name, updates_dict) — 节点返回的增量（仅 yield_updates=True 时）
+
+        返回值通过 Generator 的 send 不使用（统一用 yield）。
         """
         thread_id = self._get_thread_id(config)
 
@@ -124,10 +170,9 @@ class CompiledGraph:
             )
 
         # ── 判断是否为断点恢复 ──
-        # 有 checkpointer + 有 thread_id + 有已有 checkpoint → 恢复
-        # 不管 input 是 None 还是非 None，都忽略 input，用 checkpoint 的 state
         is_resume = False
         saved_resume = None
+        saved_resume_from: Optional[str] = None
         if self._checkpointer and thread_id:
             cp = self._checkpointer.load(thread_id)
             if cp is not None:
@@ -145,27 +190,24 @@ class CompiledGraph:
             state = {}
 
         # ── 决定从哪个节点开始 ──
-        skip_interrupt_before_once = None  # 跳过哪个节点的 interrupt_before
+        skip_interrupt_before_once: Optional[str] = None
         if is_resume and saved_resume:
             if saved_resume == END:
-                return state
+                yield ("value", state)
+                return
 
-            # interrupt_before 的恢复：记录了 resume_from（上一个节点）
-            # 需要重新从该节点路由，这样人工修改 state 后路由结果会变
             if saved_resume_from:
                 current_nodes = self._resolve_next(saved_resume_from, state)
-                # 路由结果可能直接到 END
                 if not current_nodes or current_nodes[0] == END:
-                    return state
-                # 跳过新目标节点的 interrupt_before（这次是恢复执行，不是首次到达）
+                    yield ("value", state)
+                    return
                 skip_interrupt_before_once = current_nodes[0]
             else:
-                # interrupt_after 的恢复：直接从 resume_node 开始执行
                 current_nodes = [saved_resume]
                 skip_interrupt_before_once = saved_resume
         elif is_resume and not saved_resume:
-            # 有 checkpoint 但没有断点标记 → 上次已执行完毕
-            return state
+            yield ("value", state)
+            return
         else:
             current_nodes = self._adjacency.get(START, [])
 
@@ -198,7 +240,8 @@ class CompiledGraph:
                             "resume_from": prev_node_name,
                         },
                     )
-                return state
+                yield ("value", state)
+                return
 
             # 清除跳过标志
             skip_interrupt_before_once = None
@@ -206,6 +249,11 @@ class CompiledGraph:
             # 执行节点
             node = self._nodes[next_node_name]
             updates = node.action(state)
+
+            # yield updates（stream updates 模式需要）
+            if yield_updates:
+                yield ("update", next_node_name, dict(updates))
+
             _merge_state(state, updates, self._reducers)
 
             # interrupt_after：在这个节点执行后暂停
@@ -222,7 +270,8 @@ class CompiledGraph:
                             "resume_node": resume_node,
                         },
                     )
-                return state
+                yield ("value", state)
+                return
 
             # 保存 checkpoint（非断点的常规保存）
             if self._checkpointer and thread_id:
@@ -231,11 +280,16 @@ class CompiledGraph:
                     metadata={"node": next_node_name, "step": iterations},
                 )
 
+            # yield value（stream values 模式 + invoke 都需要）
+            yield ("value", dict(state))
+
             current_nodes = self._resolve_next(next_node_name, state)
             prev_node_name = next_node_name
             iterations += 1
 
-        return state
+        # 循环正常结束（到达 END 或没有后续节点）
+        # 不需要额外 yield，上面循环中已经 yield 了每个节点的 value
+        # invoke() 会用空 dict 作为默认值
 
     def update_state(
         self,
@@ -267,11 +321,8 @@ class CompiledGraph:
                 "Run invoke() first to create an initial checkpoint."
             )
 
-        # 加载已有 state，合并人工修改，重新保存
         state = dict(cp["state"])
         _merge_state(state, values, self._reducers)
-
-        # 保留原有 metadata（特别是 resume_node）
         metadata = dict(cp["metadata"])
         self._checkpointer.save(thread_id, state, metadata=metadata)
 
@@ -308,17 +359,6 @@ class CompiledGraph:
         if not config:
             return None
         return config.get("thread_id")
-
-    def _load_resume_node(self, thread_id: str) -> Optional[str]:
-        """
-        从最新的 checkpoint metadata 中读取 resume_node。
-
-        resume_node 是断点暂停时记录的"下次恢复应该执行的节点"。
-        """
-        cp = self._checkpointer.load(thread_id)  # type: ignore
-        if cp is None:
-            return None
-        return cp["metadata"].get("resume_node")
 
     def _resolve_next(self, node_name: str, state: dict) -> list[str]:
         """
@@ -377,6 +417,10 @@ class StateGraph:
             interrupt_before=["approve"],
         )
         result = app.invoke({"key": "value"}, config={"thread_id": "t1"})
+
+    流式输出：
+        for chunk in app.stream({"key": "value"}):
+            print(chunk)  # 每个节点执行后的 state
     """
 
     def __init__(self, schema: Optional[dict] = None) -> None:
@@ -385,15 +429,13 @@ class StateGraph:
         self._conditional_edges: list[ConditionalEdge] = []
         self._reducers: dict[str, Callable] = {}
 
-        # 解析 schema 中的 reducer
         if schema is not None:
             for key, spec in schema.items():
                 if isinstance(spec, tuple) and len(spec) == 2:
-                    # {"key": (type, reducer_func)}
                     self._reducers[key] = spec[1]
 
     def add_node(self, name: str, action: Callable[[dict], dict]) -> None:
-        """注册一个节点。name 是唯一标识，action 是接收 state 返回部分 state 的函数。"""
+        """注册一个节点。"""
         if name in self._nodes:
             raise ValueError(f"Node '{name}' already exists")
         if name in (START, END):
@@ -439,7 +481,6 @@ class StateGraph:
           interrupt_after: 在这些节点执行后暂停
           max_iterations: 最大执行步数，防止无限循环
         """
-        # 检查 1：必须有 START 出边
         start_edges = [e for e in self._edges if e.src == START]
         if not start_edges:
             raise ValueError(
@@ -447,7 +488,6 @@ class StateGraph:
                 "Use add_edge(START, 'your_node') to set the entry point."
             )
 
-        # 检查 2：同一节点不能同时有固定出边和条件出边
         fixed_sources = {e.src for e in self._edges if e.src != START}
         cond_sources = {ce.src for ce in self._conditional_edges}
         conflict = fixed_sources & cond_sources
@@ -457,17 +497,14 @@ class StateGraph:
                 "Use one or the other, not both."
             )
 
-        # 构建固定边邻接表
         adjacency: dict[str, list[str]] = {}
         for edge in self._edges:
             adjacency.setdefault(edge.src, []).append(edge.dst)
 
-        # 构建条件边字典
         conditional: dict[str, ConditionalEdge] = {}
         for ce in self._conditional_edges:
             conditional[ce.src] = ce
 
-        # 检查 3：所有节点必须可达（BFS）
         reachability: dict[str, list[str]] = {}
         for edge in self._edges:
             reachability.setdefault(edge.src, []).append(edge.dst)
