@@ -178,17 +178,17 @@ class CompiledGraph:
         is_resume = False
         saved_resume: Optional[str] = None
         saved_resume_from: Optional[str] = None
+        loaded_cp: Optional[dict[str, Any]] = None
         if self._checkpointer and thread_id:
-            cp = self._checkpointer.load(thread_id)
-            if cp is not None:
+            loaded_cp = self._checkpointer.load(thread_id)
+            if loaded_cp is not None:
                 is_resume = True
-                saved_resume = cp["metadata"].get("resume_node")
-                saved_resume_from = cp["metadata"].get("resume_from")
+                saved_resume = loaded_cp["metadata"].get("resume_node")
+                saved_resume_from = loaded_cp["metadata"].get("resume_from")
 
         # ── 确定初始 state ──
         if is_resume:
-            cp = self._checkpointer.load(thread_id)
-            state: dict[str, Any] = dict(cp["state"])
+            state: dict[str, Any] = dict(loaded_cp["state"])
         elif input is not None:
             state = dict(input)
         else:
