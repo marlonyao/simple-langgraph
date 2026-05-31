@@ -16,6 +16,7 @@ Simple LangGraph — 一个简化版 LangGraph 实现
 
 from __future__ import annotations
 
+import contextvars
 from collections.abc import Generator
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, TYPE_CHECKING
@@ -51,8 +52,9 @@ class Command:
         self.resume = resume
 
 
-# 执行上下文栈：interrupt() 通过它获取当前节点信息和 resume 值
-_exec_stack: list[dict[str, Any]] = []
+# 执行上下文：interrupt() 通过 ContextVar 获取当前节点信息和 resume 值
+# ContextVar 天然线程隔离，避免并发场景下上下文互相污染
+_exec_ctx: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("_exec_ctx")
 
 _SENTINEL = object()  # 标记"还没有 resume 值"
 
@@ -64,11 +66,12 @@ def interrupt(value: Any) -> Any:
     首次调用：抛出 GraphInterrupt，value 存入 checkpoint。
     恢复后重新执行节点时：返回 Command(resume=...) 传入的值。
     """
-    if not _exec_stack:
+    try:
+        ctx = _exec_ctx.get()
+    except LookupError:
         raise RuntimeError(
             "interrupt() can only be called inside a graph node"
         )
-    ctx = _exec_stack[-1]
 
     # 检查是否有 resume 值（恢复模式）
     resume_list = ctx.get("resume", _SENTINEL)
@@ -374,12 +377,11 @@ class CompiledGraph:
                     ctx["resume"] = dynamic_resume_prefix + [resume_value]
                     ctx["interrupt_counter"] = 0
 
-                _exec_stack.append(ctx)
+                _exec_ctx_token = _exec_ctx.set(ctx)
                 try:
                     updates = node.action(state)
                 except GraphInterrupt as gi:
-                    _exec_stack.pop()
-                    # 动态中断：保存 checkpoint
+                    # 动态中断：保存 checkpoint（finally 会 reset token）
                     if not self._checkpointer:
                         raise RuntimeError(
                             "interrupt() requires a checkpointer. "
@@ -410,8 +412,7 @@ class CompiledGraph:
                     yield ("value", state)
                     return
                 finally:
-                    if _exec_stack and _exec_stack[-1] is ctx:
-                        _exec_stack.pop()
+                    _exec_ctx.reset(_exec_ctx_token)
 
                 if yield_updates:
                     yield ("update", task.node, dict(updates))

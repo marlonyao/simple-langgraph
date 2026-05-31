@@ -368,3 +368,139 @@ class TestDynamicAndStaticCoexist:
         # 恢复动态 → 完成
         r3 = compiled.invoke(Command(resume="done"), config={"thread_id": "t1"})
         assert r3 == {"x": 1, "y": 2, "answer": "done"}
+
+
+class TestConcurrencySafety:
+    """并发安全：多个图同时 interrupt，上下文互不干扰。"""
+
+    def test_two_graphs_concurrent_interrupt_isolated(self):
+        """
+        两个图分别在不同线程中调用 interrupt()，各自 resume 值互不干扰。
+
+        - 模块级 _exec_stack：所有线程共享同一个 list，后 push 的覆盖前一个
+        - ContextVar：每个线程有独立副本，天然隔离
+        """
+        import threading
+        from simple_langgraph import StateGraph, START, END
+        from simple_langgraph.graph import interrupt, Command
+        from simple_langgraph.checkpoint import MemorySaver
+
+        results = {}
+        errors = {}
+
+        def make_node(label, resume_val):
+            def node(state):
+                answer = interrupt(f"{label} 中断")
+                return {"answer": answer, "label": label}
+            return node
+
+        def run_graph(label, resume_val):
+            try:
+                graph = StateGraph()
+                graph.add_node("n", make_node(label, resume_val))
+                graph.add_edge(START, "n")
+
+                saver = MemorySaver()
+                compiled = graph.compile(checkpointer=saver)
+
+                # 第一次执行 → interrupt
+                r1 = compiled.invoke({}, config={"thread_id": f"{label}_t"})
+                # 恢复 → 传入各自的 resume 值
+                r2 = compiled.invoke(
+                    Command(resume=resume_val),
+                    config={"thread_id": f"{label}_t"},
+                )
+                results[label] = r2
+            except Exception as e:
+                errors[label] = e
+
+        t1 = threading.Thread(target=run_graph, args=("A", "resume_A"))
+        t2 = threading.Thread(target=run_graph, args=("B", "resume_B"))
+        t1.start()
+        t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        assert not errors, f"线程报错: {errors}"
+        assert results["A"]["answer"] == "resume_A"
+        assert results["B"]["answer"] == "resume_B"
+
+    def test_exec_context_thread_local_isolation(self):
+        """
+        直接验证：线程 A 设置执行上下文后，线程 B 的 interrupt() 读不到它。
+
+        这是 _exec_stack vs ContextVar 的核心区别测试。
+        模拟两个线程先后执行节点，如果用共享 list，
+        线程 B 会在线程 A pop 之前读到 A 的上下文。
+        """
+        import threading
+        from simple_langgraph.graph import interrupt
+
+        read_ctx = {}
+        errors = {}
+
+        def thread_a():
+            """线程 A：设置上下文后阻塞，让线程 B 有机会读到它"""
+            try:
+                # 模拟图执行设置上下文
+                from simple_langgraph.graph import _exec_ctx
+                token = _exec_ctx.set({"node": "A", "resume": ["val_A"], "interrupt_counter": 0})
+                sync_a_ready.set()
+                sync_a_continue.wait(timeout=3)
+                _exec_ctx.reset(token)
+            except Exception as e:
+                errors["A"] = e
+
+        def thread_b():
+            """线程 B：试图读取 interrupt 上下文"""
+            try:
+                sync_a_ready.wait(timeout=3)
+                # 此时线程 A 的上下文应该对 B 不可见
+                try:
+                    from simple_langgraph.graph import _exec_ctx
+                    ctx = _exec_ctx.get()
+                    read_ctx["B"] = ctx
+                except LookupError:
+                    read_ctx["B"] = None  # 正确：B 没有设置上下文
+            except Exception as e:
+                errors["B"] = e
+            finally:
+                sync_a_continue.set()
+
+        sync_a_ready = threading.Event()
+        sync_a_continue = threading.Event()
+
+        ta = threading.Thread(target=thread_a)
+        tb = threading.Thread(target=thread_b)
+        ta.start()
+        tb.start()
+        ta.join(timeout=5)
+        tb.join(timeout=5)
+
+        assert not errors, f"线程报错: {errors}"
+        # B 不应该读到 A 的上下文
+        assert read_ctx.get("B") is None, \
+            f"线程 B 不应读到线程 A 的上下文，但读到了: {read_ctx['B']}"
+
+    def test_interrupt_outside_node_raises_even_after_graph_run(self):
+        """
+        图执行完毕后，interrupt() 不应泄漏上下文。
+        模块级 _exec_stack 执行完如果没 pop 干净会泄漏。
+        ContextVar 在 reset 后自动恢复空状态。
+        """
+        from simple_langgraph import StateGraph, START, END
+        from simple_langgraph.graph import interrupt, GraphInterrupt
+        from simple_langgraph.checkpoint import MemorySaver
+
+        def node_a(state):
+            return {"x": 1}
+
+        graph = StateGraph()
+        graph.add_node("a", node_a)
+        graph.add_edge(START, "a")
+        compiled = graph.compile(checkpointer=MemorySaver())
+        compiled.invoke({}, config={"thread_id": "t1"})
+
+        # 图执行完毕，interrupt 应该报 RuntimeError
+        with pytest.raises(RuntimeError, match="interrupt"):
+            interrupt("不应被调用")
