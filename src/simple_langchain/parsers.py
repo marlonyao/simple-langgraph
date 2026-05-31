@@ -12,8 +12,10 @@ import json
 import re
 from typing import Any
 
+from simple_langchain.runnable import Runnable
 
-class BaseOutputParser:
+
+class BaseOutputParser(Runnable):
     """所有解析器的基类"""
 
     def parse(self, output: str) -> Any:
@@ -22,6 +24,10 @@ class BaseOutputParser:
     def get_format_instructions(self) -> str:
         """返回给 LLM 的格式说明（可嵌入 prompt）"""
         return ""
+
+    def invoke(self, input: str) -> Any:
+        """Runnable 接口：input 是 LLM 输出字符串，输出解析结果"""
+        return self.parse(input)
 
 
 class StrOutputParser(BaseOutputParser):

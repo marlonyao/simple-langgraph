@@ -2,7 +2,7 @@
 Simple LangChain — Prompt 模板
 
 核心概念：
-- PromptTemplate：纯文本模板，支持 {variable} 变量插值
+- PromptTemplate：纯文本模板，支持 {variable} 变量插值（继承 Runnable）
 - ChatPromptTemplate：消息角色模板（system / human / ai）
 - partial()：偏应用，预填充部分变量
 """
@@ -10,8 +10,10 @@ Simple LangChain — Prompt 模板
 import re
 from typing import Any
 
+from simple_langchain.runnable import Runnable
 
-class PromptTemplate:
+
+class PromptTemplate(Runnable):
     """
     提示词模板。
 
@@ -19,6 +21,8 @@ class PromptTemplate:
     调用 format() 时用实际值替换。
 
     支持双花括号转义：{{ }} → { }
+
+    作为 Runnable：invoke(dict) → format(dict) → str
     """
 
     def __init__(
@@ -93,6 +97,10 @@ class PromptTemplate:
         new_variables = [v for v in self.input_variables if v not in kwargs]
 
         return PromptTemplate(template=new_template, input_variables=new_variables)
+
+    def invoke(self, input: dict[str, Any]) -> str:
+        """Runnable 接口：input 是 dict，输出格式化后的字符串"""
+        return self.format(**input)
 
 
 class ChatPromptTemplate:

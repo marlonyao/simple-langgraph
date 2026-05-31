@@ -42,6 +42,61 @@ class TestTool:
         assert "北京" in result
         assert "晴天" in result
 
+    def test_tool_with_args_schema_accepts_dict(self):
+        """Tool 带 args_schema 时，run() 接受 dict 参数"""
+        from simple_langchain.agents import Tool
+        from pydantic import BaseModel
+
+        class CalculatorInput(BaseModel):
+            a: int
+            b: int
+
+        def multiply(a: int, b: int) -> int:
+            return a * b
+
+        tool = Tool(
+            name="multiply",
+            description="两数相乘",
+            func=multiply,
+            args_schema=CalculatorInput,
+        )
+        result = tool.run({"a": 3, "b": 4})
+        assert result == "12"
+
+    def test_tool_with_args_schema_single_arg(self):
+        """单参数工具仍然支持字符串输入"""
+        from simple_langchain.agents import Tool
+
+        tool = Tool(
+            name="echo",
+            description="回显",
+            func=lambda x: f"echo: {x}",
+        )
+        assert tool.run("hello") == "echo: hello"
+
+    def test_tool_args_schema_converts_and_validates(self):
+        """args_schema 自动做类型转换"""
+        from simple_langchain.agents import Tool
+        from pydantic import BaseModel
+
+        class SearchInput(BaseModel):
+            query: str
+            limit: int
+
+        def search(query: str, limit: int) -> str:
+            return f"搜索 '{query}'，返回 {limit} 条结果"
+
+        tool = Tool(
+            name="search",
+            description="搜索",
+            func=search,
+            args_schema=SearchInput,
+        )
+        # limit 传字符串也能自动转 int
+        result = tool.run({"query": "Python", "limit": "5"})
+        assert "Python" in result
+        assert "5 条" in result
+
 
 # ============================================================
 # AgentExecutor

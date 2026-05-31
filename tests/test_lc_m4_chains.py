@@ -90,6 +90,73 @@ class TestLLMChain:
         result = chain.invoke({"word": "hi"})
         assert isinstance(result, str)
 
+    def test_chain_auto_injects_format_instructions(self):
+        """LLMChain 自动把 parser.get_format_instructions() 注入到 prompt 变量"""
+        from simple_langchain.prompts import PromptTemplate
+        from simple_langchain.llms import FakeListLLM
+        from simple_langchain.parsers import JsonOutputParser
+        from simple_langchain.chains import LLMChain
+
+        # prompt 里必须有 {format_instructions} 占位符
+        prompt = PromptTemplate.from_template(
+            "回答问题：{question}\n{format_instructions}"
+        )
+        llm = FakeListLLM(responses=['{"answer": "42"}'])
+        parser = JsonOutputParser()
+
+        chain = LLMChain(prompt=prompt, llm=llm, output_parser=parser)
+        result = chain.invoke({"question": "生命的意义"})
+        assert result == {"answer": "42"}
+
+    def test_chain_format_instructions_in_prompt(self):
+        """验证 format_instructions 确实被拼进了 prompt"""
+        from simple_langchain.prompts import PromptTemplate
+        from simple_langchain.parsers import PydanticOutputParser
+        from simple_langchain.chains import LLMChain
+        from simple_langchain.llms import BaseLLM
+        from pydantic import BaseModel
+
+        class ColorInfo(BaseModel):
+            name: str
+            hex_code: str
+
+        received_prompts = []
+
+        class SpyLLM(BaseLLM):
+            def _invoke(self, prompt: str) -> str:
+                received_prompts.append(prompt)
+                return '{"name": "red", "hex_code": "#FF0000"}'
+
+        prompt = PromptTemplate.from_template(
+            "{question}\n{format_instructions}"
+        )
+        parser = PydanticOutputParser(pydantic_object=ColorInfo)
+        llm = SpyLLM()
+
+        chain = LLMChain(prompt=prompt, llm=llm, output_parser=parser)
+        chain.invoke({"question": "描述红色"})
+
+        # 收到的 prompt 应该包含 format_instructions 的内容
+        assert "JSON" in received_prompts[0] or "json" in received_prompts[0].lower()
+        assert "name" in received_prompts[0]
+        assert "hex_code" in received_prompts[0]
+
+    def test_chain_without_format_instructions_in_prompt_still_works(self):
+        """prompt 没有 {format_instructions} 也不报错（向后兼容）"""
+        from simple_langchain.prompts import PromptTemplate
+        from simple_langchain.llms import FakeListLLM
+        from simple_langchain.parsers import JsonOutputParser
+        from simple_langchain.chains import LLMChain
+
+        prompt = PromptTemplate.from_template("列出{category}中的3种动物")
+        llm = FakeListLLM(responses=['{"animals": ["猫", "狗", "鸟"]}'])
+        parser = JsonOutputParser()
+
+        chain = LLMChain(prompt=prompt, llm=llm, output_parser=parser)
+        # 不应该抛异常，正常执行
+        result = chain.invoke({"category": "宠物"})
+        assert result == {"animals": ["猫", "狗", "鸟"]}
+
 
 # ============================================================
 # SequentialChain

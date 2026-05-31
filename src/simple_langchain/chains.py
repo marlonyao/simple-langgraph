@@ -45,19 +45,28 @@ class LLMChain:
         """
         执行链：
         1. 注入记忆到 inputs（如有 memory）
-        2. 用 inputs 填充 prompt 模板
-        3. 调用 LLM
-        4. 解析输出
-        5. 保存到 memory（如有 memory）
+        2. 自动注入 parser 的 format_instructions（如 prompt 有此变量）
+        3. 用 inputs 填充 prompt 模板
+        4. 调用 LLM
+        5. 解析输出
+        6. 保存到 memory（如有 memory）
         """
+        inputs = dict(inputs)
+
         # 注入记忆
         if self.memory:
             history = self.memory.load_memory()
             history_str = "\n".join(
                 f"{m['role']}: {m['content']}" for m in history
             )
-            inputs = dict(inputs)
             inputs["history"] = history_str
+
+        # 自动注入 format_instructions（仅当 prompt 模板有此变量时）
+        if "format_instructions" in self.prompt.input_variables:
+            inputs.setdefault(
+                "format_instructions",
+                self.output_parser.get_format_instructions(),
+            )
 
         # 1. 格式化 prompt
         formatted = self.prompt.format(**inputs)

@@ -14,6 +14,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from simple_langchain.runnable import Runnable
+
 
 @dataclass
 class Usage:
@@ -57,12 +59,14 @@ class LLMResult:
         return result
 
 
-class BaseLLM(ABC):
+class BaseLLM(Runnable, ABC):
     """
     LLM 抽象基类。
 
-    子类只需实现 _invoke(prompt) -> str，
+    继承 Runnable，子类只需实现 _invoke(prompt) -> str，
     invoke()、invoke_full()、generate() 由基类提供，包含回调和 usage 逻辑。
+
+    作为 Runnable：invoke(str) → str（直接生成文本）
     """
 
     def __init__(self, callbacks: dict[str, Callable] | None = None):
@@ -159,6 +163,30 @@ class FakeListLLM(BaseLLM):
     def _invoke(self, prompt: str) -> str:
         if not self._responses:
             raise RuntimeError("FakeListLLM has empty responses list")
+        response = self._responses[self._index % len(self._responses)]
+        self._index += 1
+        return response
+
+
+class FakeToolCallLLM:
+    """
+    测试用假 LLM：返回结构化 tool_call 格式。
+
+    和 FakeListLLM 不同，这个不继承 BaseLLM，
+    因为它的 invoke 返回 dict 而不是 str。
+
+    返回格式：
+    - {"tool_calls": [{"name": "...", "arguments": {...}}]}  → 工具调用
+    - {"content": "..."}  → 最终文本回答
+    """
+
+    def __init__(self, responses: list[dict]):
+        self._responses = responses
+        self._index = 0
+
+    def invoke(self, prompt: str) -> dict:
+        if not self._responses:
+            raise RuntimeError("FakeToolCallLLM has empty responses list")
         response = self._responses[self._index % len(self._responses)]
         self._index += 1
         return response
