@@ -135,6 +135,7 @@ class _Task:
     """内部任务：任务队列执行模型（类似官方 LangGraph）"""
     node: str
     state: str = "pending"   # pending / interrupted / completed
+    sources: list[str] | None = None  # 条件边来源列表（用于恢复时精确重路由）
 
 
 # ─── 编译后的图（执行器） ──────────────────────────────────────────
@@ -268,28 +269,43 @@ class CompiledGraph:
                 for t in raw_pending:
                     node = t["node"]
                     task_state = t.get("state", "pending")
+                    sources = t.get("sources")
                     rerouted = False
 
-                    # 只有 pending/interrupted 的节点需要重算条件边路由
-                    if task_state != "completed":
-                        for src, cond in self._conditional.items():
+                    # 只有 pending/interrupted 且有条件边来源的节点需要精确重路由
+                    # 检查每个 source：只要有一个 source 仍然指向该节点，就保留
+                    if task_state != "completed" and sources:
+                        still_targeting = []
+                        new_targets = []
+                        for src in sources:
+                            if src not in self._conditional:
+                                still_targeting.append(src)
+                                continue
+                            cond = self._conditional[src]
                             try:
                                 result = cond.path_fn(state)
                                 if cond.path_map and result in cond.path_map:
                                     result = cond.path_map[result]
+                                if result == node or result == END:
+                                    still_targeting.append(src)
+                                else:
+                                    new_targets.append((src, result))
                             except Exception:
-                                continue
-                            if result == node or result == END:
-                                continue
-                            is_fixed_target = any(
-                                node in dsts for _s, dsts in self._adjacency.items()
-                                if _s == src
-                            )
-                            if not is_fixed_target:
-                                if not any(rt.node == result for rt in ready_tasks):
-                                    ready_tasks.append(_Task(node=result))
-                                rerouted = True
-                                break
+                                still_targeting.append(src)
+
+                        # 添加重路由的新目标（去重）
+                        for src, new_node in new_targets:
+                            if not any(rt.node == new_node for rt in ready_tasks):
+                                ready_tasks.append(_Task(node=new_node, sources=[src]))
+
+                        if still_targeting:
+                            # 至少一个来源仍指向该节点 → 保留
+                            if not any(rt.node == node for rt in ready_tasks):
+                                ready_tasks.append(_Task(node=node, state="pending", sources=still_targeting))
+                        else:
+                            # 所有来源都重路由了 → 不保留原节点
+                            rerouted = True
+
                     if not rerouted:
                         if not any(rt.node == node for rt in ready_tasks):
                             # 恢复时：completed 保持原样（Phase 2 跳过，Phase 3 计入 barrier）
@@ -298,7 +314,7 @@ class CompiledGraph:
                                 task_state if task_state == "completed"
                                 else "pending"
                             )
-                            ready_tasks.append(_Task(node=node, state=restored_state))
+                            ready_tasks.append(_Task(node=node, state=restored_state, sources=sources))
             else:
                 # 已执行完毕（无 pending_tasks）→ 直接返回 state
                 yield ("value", state)
@@ -349,7 +365,11 @@ class CompiledGraph:
                             "step": iterations,
                             "interrupt": "before",
                             "pending_tasks": [
-                                {"node": t.node, "state": t.state}
+                                {
+                                    "node": t.node,
+                                    "state": t.state,
+                                    **({"sources": t.sources} if t.sources else {}),
+                                }
                                 for t in ready_tasks
                             ],
                         },
@@ -409,6 +429,7 @@ class CompiledGraph:
                                             if t is task
                                             else {}
                                         ),
+                                        **({"sources": t.sources} if t.sources else {}),
                                     }
                                     for t in ready_tasks
                                 ],
@@ -434,17 +455,33 @@ class CompiledGraph:
                             t for t in ready_tasks if t.state == "pending"
                         ]
                         successors = self._resolve_next(task.node, state)
+                        has_cond = task.node in self._conditional
                         pending: list[dict[str, str]] = [
-                            {"node": t.node, "state": "pending"}
+                            {
+                                "node": t.node,
+                                "state": "pending",
+                                **({"sources": t.sources} if t.sources else {}),
+                            }
                             for t in remaining
                         ]
                         for s in successors:
-                            if s != END and not any(
-                                p["node"] == s for p in pending
-                            ):
-                                pending.append(
-                                    {"node": s, "state": "pending"}
+                            if s != END:
+                                existing_p = next(
+                                    (p for p in pending if p["node"] == s),
+                                    None,
                                 )
+                                if existing_p and has_cond:
+                                    # 追加 source
+                                    srcs = existing_p.get("sources", [])
+                                    if task.node not in srcs:
+                                        srcs.append(task.node)
+                                    existing_p["sources"] = srcs
+                                elif not existing_p:
+                                    pending.append({
+                                        "node": s,
+                                        "state": "pending",
+                                        **({"sources": [task.node]} if has_cond else {}),
+                                    })
                         self._checkpointer.save(
                             thread_id, state,
                             metadata={
@@ -502,10 +539,18 @@ class CompiledGraph:
                             f"invalid node '{cond_succ}'. "
                             f"Valid nodes: {list(self._nodes.keys())}"
                         )
-                    if not any(
-                        t.node == cond_succ for t in next_tasks
-                    ):
-                        next_tasks.append(_Task(node=cond_succ))
+                    existing = next(
+                        (t for t in next_tasks if t.node == cond_succ),
+                        None,
+                    )
+                    if existing:
+                        # 同节点已有任务，追加 source
+                        if existing.sources is None:
+                            existing.sources = [node_name]
+                        elif node_name not in existing.sources:
+                            existing.sources.append(node_name)
+                    else:
+                        next_tasks.append(_Task(node=cond_succ, sources=[node_name]))
 
                 # 处理固定边后继：走 barrier + 扇入逻辑
                 for succ in fixed_succs:
