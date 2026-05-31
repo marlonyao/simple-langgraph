@@ -74,6 +74,13 @@ class ConditionalEdge:
     path_map: Optional[dict[str, str]] = None  # 可选映射：返回值 → 节点名
 
 
+@dataclass
+class _Task:
+    """内部任务：任务队列执行模型（类似官方 LangGraph）"""
+    node: str
+    state: str = "pending"   # pending / interrupted / completed
+
+
 # ─── 编译后的图（执行器） ──────────────────────────────────────────
 class CompiledGraph:
     """
@@ -155,11 +162,13 @@ class CompiledGraph:
         yield_updates: bool = False,
     ) -> Generator[tuple, dict[str, Any], None]:
         """
-        内部执行引擎：基于波次的 DAG 执行。
+        内部执行引擎：基于任务队列的波次 DAG 执行（类似官方 LangGraph）。
 
-        每个波次（wave）中的节点可以并行执行（当前实现为顺序执行）。
-        支持扇出（一个节点 → 多个后继）和扇入（多个前驱 → 一个节点）。
-        扇入通过 barrier 机制实现：只有所有前驱都完成后，后继节点才变为就绪。
+        核心变化：
+        - 每个节点执行生成 _Task（pending / interrupted / completed）
+        - interrupt_before：任务首次入队时检查，标记 interrupted
+        - 恢复时：interrupted → pending，跳过 interrupt 检查
+        - 支持扇出多节点同时中断 + 全部恢复
 
         yield 元组：
         - ("value", state_dict) — 节点执行后的完整 state
@@ -174,115 +183,151 @@ class CompiledGraph:
                 "Pass config={'thread_id': 'your-id'} to invoke()."
             )
 
-        # ── 断点恢复判断 ──
-        is_resume = False
-        saved_resume: Optional[str] = None
-        saved_resume_from: Optional[str] = None
+        # ── 加载 checkpoint ──
         loaded_cp: Optional[dict[str, Any]] = None
         if self._checkpointer and thread_id:
             loaded_cp = self._checkpointer.load(thread_id)
-            if loaded_cp is not None:
-                is_resume = True
-                saved_resume = loaded_cp["metadata"].get("resume_node")
-                saved_resume_from = loaded_cp["metadata"].get("resume_from")
 
-        # ── 确定初始 state ──
-        if is_resume:
-            state: dict[str, Any] = dict(loaded_cp["state"])
-        elif input is not None:
-            state = dict(input)
-        else:
-            state = {}
+        # ── 确定初始 state 和任务队列 ──
+        is_resuming = False
+        if loaded_cp is not None:
+            state = dict(loaded_cp["state"])
+            raw_pending = loaded_cp["metadata"].get("pending_tasks")
+            if raw_pending:
+                # 从断点恢复：重新计算条件边路由
+                # 对每个 pending 节点，如果它可能来自条件边（required=0），
+                # 则重新评估所有条件边源的路由
+                is_resuming = True
+                final_nodes: list[str] = []
+                for t in raw_pending:
+                    node = t["node"]
+                    rerouted = False
+                    # 检查 node 是否来自条件边（required=0 且有条件边指向它）
+                    for src, cond in self._conditional.items():
+                        # 用当前 state 重新算路由
+                        try:
+                            result = cond.path_fn(state)
+                            if cond.path_map and result in cond.path_map:
+                                result = cond.path_map[result]
+                        except Exception:
+                            continue
+                        # 如果 node 在这条条件边的"可达范围"内：
+                        # 即 src 有固定边到 node，或者 result 可能是 node
+                        # 简单判断：result == node → 不需要替换
+                        #             result != node → 如果 node 不是任何固定边目标，
+                        #                               说明 node 只能是条件边目标 → 替换
+                        if result == node or result == END:
+                            continue
+                        # node 是不是条件边目标？检查它是否不是固定边目标
+                        is_fixed_target = any(
+                            node in dsts for _s, dsts in self._adjacency.items()
+                            if _s == src
+                        )
+                        if not is_fixed_target:
+                            # node 来自条件边，路由结果变了
+                            if result not in final_nodes:
+                                final_nodes.append(result)
+                            rerouted = True
+                            break
+                    if not rerouted:
+                        if node not in final_nodes:
+                            final_nodes.append(node)
 
-        # ── 决定从哪个节点开始 ──
-        skip_interrupt_before_once: Optional[str] = None
-        if is_resume and saved_resume:
-            if saved_resume == END:
+                ready_tasks = [_Task(node=n) for n in final_nodes]
+            else:
+                # 已执行完毕（无 pending_tasks）→ 直接返回 state
                 yield ("value", state)
                 return
-
-            if saved_resume_from:
-                next_nodes = self._resolve_next(saved_resume_from, state)
-                if not next_nodes or next_nodes[0] == END:
-                    yield ("value", state)
-                    return
-                skip_interrupt_before_once = next_nodes[0]
-                # 恢复时只执行路由目标这一个节点
-                ready: list[str] = [next_nodes[0]]
-            else:
-                ready = [saved_resume]
-                skip_interrupt_before_once = saved_resume
-        elif is_resume and not saved_resume:
-            yield ("value", state)
-            return
         else:
+            # 全新执行
+            state = dict(input) if input is not None else {}
             raw_start = list(self._adjacency.get(START, []))
-            ready = [n for n in raw_start if n != END]
+            ready_tasks = [_Task(node=n) for n in raw_start if n != END]
 
         # ── 波次执行 ──
-        # barrier: 追踪每个节点有多少前驱已完成
-        # incoming_count 记录了每个节点需要的入边数（不含 START）
-        barrier: dict[str, int] = {}  # node → 已完成的前驱数
-        wave_executed: set[str] = set()  # 当前波次已执行（防止同波次重复）
+        barrier: dict[str, int] = {}
         iterations = 0
 
-        while ready:
+        while ready_tasks:
             if iterations >= self._max_iterations:
                 raise RuntimeError(
                     f"Graph execution exceeded maximum iterations ({self._max_iterations}). "
                     "This likely indicates an infinite loop in your graph."
                 )
 
-            # ── 执行当前波次的所有节点 ──
+            # Phase 1: interrupt_before 检查（恢复时跳过）
+            has_interrupt = False
+            if not is_resuming:
+                for task in ready_tasks:
+                    if task.node in self._interrupt_before:
+                        task.state = "interrupted"
+                        has_interrupt = True
+
+            if has_interrupt:
+                if self._checkpointer and thread_id:
+                    self._checkpointer.save(
+                        thread_id, state,
+                        metadata={
+                            "node": next(
+                                t.node for t in ready_tasks
+                                if t.state == "interrupted"
+                            ),
+                            "step": iterations,
+                            "interrupt": "before",
+                            "pending_tasks": [
+                                {"node": t.node, "state": t.state}
+                                for t in ready_tasks
+                            ],
+                        },
+                    )
+                yield ("value", state)
+                return
+
+            # 恢复标记只在第一个波次生效
+            is_resuming = False
+
+            # Phase 2: 执行所有 pending 任务
             wave_updates: list[tuple[str, dict[str, Any]]] = []
-            wave_executed.clear()  # 清空当前波次已执行集合
+            for task in ready_tasks:
+                if task.state != "pending":
+                    continue
 
-            for node_name in ready:
-                # interrupt_before 检查
-                if node_name in self._interrupt_before and node_name != skip_interrupt_before_once:
-                    if self._checkpointer and thread_id:
-                        # 找到这个节点的前驱（用于 resume_from）
-                        prev = self._find_predecessor(node_name, state, ready)
-                        self._checkpointer.save(
-                            thread_id, state,
-                            metadata={
-                                "node": node_name,
-                                "step": iterations,
-                                "interrupt": "before",
-                                "resume_node": node_name,
-                                "resume_from": prev,
-                            },
-                        )
-                    yield ("value", state)
-                    return
-
-            # 清除 skip 标志
-            skip_interrupt_before_once = None
-
-            # 执行波次中的每个节点
-            for node_name in ready:
-                node = self._nodes[node_name]
+                node = self._nodes[task.node]
                 updates = node.action(state)
 
                 if yield_updates:
-                    yield ("update", node_name, dict(updates))
+                    yield ("update", task.node, dict(updates))
 
                 _merge_state(state, updates, self._reducers)
-                wave_updates.append((node_name, dict(updates)))
-                wave_executed.add(node_name)
+                wave_updates.append((task.node, dict(updates)))
+                task.state = "completed"
 
                 # interrupt_after 检查
-                if node_name in self._interrupt_after:
+                if task.node in self._interrupt_after:
                     if self._checkpointer and thread_id:
-                        successors = self._resolve_next(node_name, state)
-                        resume_node = successors[0] if successors else END
+                        # 保存剩余 pending + 后继任务
+                        remaining = [
+                            t for t in ready_tasks if t.state == "pending"
+                        ]
+                        successors = self._resolve_next(task.node, state)
+                        pending: list[dict[str, str]] = [
+                            {"node": t.node, "state": "pending"}
+                            for t in remaining
+                        ]
+                        for s in successors:
+                            if s != END and not any(
+                                p["node"] == s for p in pending
+                            ):
+                                pending.append(
+                                    {"node": s, "state": "pending"}
+                                )
                         self._checkpointer.save(
                             thread_id, state,
                             metadata={
-                                "node": node_name,
+                                "node": task.node,
                                 "step": iterations,
                                 "interrupt": "after",
-                                "resume_node": resume_node,
+                                "pending_tasks": pending,
                             },
                         )
                     yield ("value", state)
@@ -292,55 +337,65 @@ class CompiledGraph:
                 if self._checkpointer and thread_id:
                     self._checkpointer.save(
                         thread_id, state,
-                        metadata={"node": node_name, "step": iterations},
+                        metadata={
+                            "node": task.node,
+                            "step": iterations,
+                            "pending_tasks": [],
+                        },
                     )
 
                 yield ("value", dict(state))
 
             iterations += 1
 
-            # ── 计算下一波次的就绪节点 ──
-            next_ready: list[str] = []
+            # Phase 3: 计算下一波次就绪节点
+            executed_nodes = {
+                t.node for t in ready_tasks if t.state == "completed"
+            }
+            next_tasks: list[_Task] = []
             for node_name, _ in wave_updates:
-                successors = self._resolve_next(node_name, state)
-                for succ in successors:
+                # 固定边后继（可能参与扇入 barrier）
+                fixed_succs = self._adjacency.get(node_name, [])
+                # 条件边后继（required=0，不受 barrier 限制）
+                cond = self._conditional.get(node_name)
+                cond_succ = None
+                if cond:
+                    result = cond.path_fn(state)
+                    if cond.path_map and result in cond.path_map:
+                        result = cond.path_map[result]
+                    if result != END:
+                        cond_succ = result
+
+                # 处理条件边后继：不走 barrier，不受 executed_nodes 限制
+                if cond_succ:
+                    if cond_succ not in self._nodes:
+                        raise ValueError(
+                            f"Conditional edge from '{node_name}' returned "
+                            f"invalid node '{cond_succ}'. "
+                            f"Valid nodes: {list(self._nodes.keys())}"
+                        )
+                    if not any(
+                        t.node == cond_succ for t in next_tasks
+                    ):
+                        next_tasks.append(_Task(node=cond_succ))
+
+                # 处理固定边后继：走 barrier + 扇入逻辑
+                for succ in fixed_succs:
                     if succ == END:
                         continue
                     barrier[succ] = barrier.get(succ, 0) + 1
                     required = self._incoming_count.get(succ, 0)
-                    # 条件边的目标（required=0）直接就绪，不受 wave_executed 限制
-                    # 固定边的目标需要所有前驱完成，且不在当前波次已执行列表里
                     if required == 0:
-                        if succ not in next_ready:
-                            next_ready.append(succ)
-                    elif barrier[succ] >= required and succ not in wave_executed:
-                        if succ not in next_ready:
-                            next_ready.append(succ)
+                        # START 直连的固定边（罕见），不受 executed 限制
+                        if not any(t.node == succ for t in next_tasks):
+                            next_tasks.append(_Task(node=succ))
+                    elif barrier[succ] >= required:
+                        if succ not in executed_nodes and not any(
+                            t.node == succ for t in next_tasks
+                        ):
+                            next_tasks.append(_Task(node=succ))
 
-            ready = next_ready
-
-    def _find_predecessor(
-        self, node_name: str, state: dict, current_wave: list[str]
-    ) -> Optional[str]:
-        """
-        找到 node_name 的前驱节点名（用于 interrupt_before 的 resume_from）。
-        查找固定边邻接表和条件边。
-        """
-        # 查固定边
-        for src, dsts in self._adjacency.items():
-            if node_name in dsts:
-                return src
-        # 查条件边：需要尝试哪个条件边的路由会指向 node_name
-        for src, cond in self._conditional.items():
-            try:
-                result = cond.path_fn(state)
-                if cond.path_map and result in cond.path_map:
-                    result = cond.path_map[result]
-                if result == node_name:
-                    return src
-            except Exception:
-                pass
-        return None
+            ready_tasks = next_tasks
 
     def update_state(
         self,

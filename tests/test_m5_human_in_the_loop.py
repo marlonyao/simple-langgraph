@@ -444,3 +444,109 @@ class TestInterruptEdgeCases:
                 config={"thread_id": "t1"},
                 values={"x": 1},
             )
+
+
+# ============================================================
+# 测试 6: 扇出 + 断点（任务队列模型）
+# ============================================================
+class TestFanOutInterrupt:
+
+    def test_fanout_interrupt_before_resumes_all(self):
+        """
+        菱形图：A → [B, C] → D，interrupt_before=[B, C]
+        第一次：执行 A，在 B 和 C 之前停住
+        恢复：B 和 C 都应该执行，然后 D 执行
+        """
+        from simple_langgraph import StateGraph, START, END
+        from simple_langgraph.checkpoint import MemorySaver
+
+        graph = StateGraph()
+        graph.add_node("a", lambda s: {"steps": s.get("steps", []) + ["a"]})
+        graph.add_node("b", lambda s: {"steps": s.get("steps", []) + ["b"]})
+        graph.add_node("c", lambda s: {"steps": s.get("steps", []) + ["c"]})
+        graph.add_node("d", lambda s: {"steps": s.get("steps", []) + ["d"]})
+        graph.add_edge(START, "a")
+        graph.add_edge("a", "b")
+        graph.add_edge("a", "c")
+        graph.add_edge("b", "d")
+        graph.add_edge("c", "d")
+        graph.add_edge("d", END)
+
+        app = graph.compile(
+            checkpointer=MemorySaver(),
+            interrupt_before=["b", "c"],
+        )
+
+        # 第一次：执行 A，停在 B 和 C 之前
+        r1 = app.invoke({"steps": []}, config={"thread_id": "t1"})
+        assert r1["steps"] == ["a"]
+
+        # 恢复：B 和 C 都执行，然后 D
+        r2 = app.invoke(None, config={"thread_id": "t1"})
+        assert set(r2["steps"]) == {"a", "b", "c", "d"}
+
+    def test_fanout_interrupt_after_resumes_all_successors(self):
+        """
+        扇出：START → A → [B, C]，interrupt_after=[A]
+        第一次：执行 A，停住
+        恢复：B 和 C 都应该执行
+        """
+        from simple_langgraph import StateGraph, START, END
+        from simple_langgraph.checkpoint import MemorySaver
+
+        graph = StateGraph()
+        graph.add_node("a", lambda s: {"steps": s.get("steps", []) + ["a"]})
+        graph.add_node("b", lambda s: {"steps": s.get("steps", []) + ["b"]})
+        graph.add_node("c", lambda s: {"steps": s.get("steps", []) + ["c"]})
+        graph.add_edge(START, "a")
+        graph.add_edge("a", "b")
+        graph.add_edge("a", "c")
+        graph.add_edge("b", END)
+        graph.add_edge("c", END)
+
+        app = graph.compile(
+            checkpointer=MemorySaver(),
+            interrupt_after=["a"],
+        )
+
+        # 第一次：执行 A，停住
+        r1 = app.invoke({"steps": []}, config={"thread_id": "t1"})
+        assert r1["steps"] == ["a"]
+
+        # 恢复：B 和 C 都执行
+        r2 = app.invoke(None, config={"thread_id": "t1"})
+        assert set(r2["steps"]) == {"a", "b", "c"}
+
+    def test_fanout_interrupt_before_one_of_two_saves_wave(self):
+        """
+        扇出：A → [B, C]，interrupt_before=[B]（只拦 B，不拦 C）
+        第一次：B 被拦，但整个波次应该保存（C 也保存）
+        恢复：B 和 C 都执行
+        """
+        from simple_langgraph import StateGraph, START, END
+        from simple_langgraph.checkpoint import MemorySaver
+
+        graph = StateGraph()
+        graph.add_node("a", lambda s: {"steps": s.get("steps", []) + ["a"]})
+        graph.add_node("b", lambda s: {"steps": s.get("steps", []) + ["b"]})
+        graph.add_node("c", lambda s: {"steps": s.get("steps", []) + ["c"]})
+        graph.add_node("d", lambda s: {"steps": s.get("steps", []) + ["d"]})
+        graph.add_edge(START, "a")
+        graph.add_edge("a", "b")
+        graph.add_edge("a", "c")
+        graph.add_edge("b", "d")
+        graph.add_edge("c", "d")
+        graph.add_edge("d", END)
+
+        app = graph.compile(
+            checkpointer=MemorySaver(),
+            interrupt_before=["b"],
+        )
+
+        # 第一次：A 执行，B 被拦（C 也应该在 checkpoint 里）
+        r1 = app.invoke({"steps": []}, config={"thread_id": "t1"})
+        assert r1["steps"] == ["a"]
+
+        # 恢复：B 和 C 都执行，然后 D
+        r2 = app.invoke(None, config={"thread_id": "t1"})
+        assert set(r2["steps"]) == {"a", "b", "c", "d"}
