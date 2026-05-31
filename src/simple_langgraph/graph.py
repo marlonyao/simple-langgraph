@@ -260,46 +260,45 @@ class CompiledGraph:
             state = dict(loaded_cp["state"])
             raw_pending = loaded_cp["metadata"].get("pending_tasks")
             if raw_pending:
-                # 从断点恢复：重新计算条件边路由
-                # 对每个 pending 节点，如果它可能来自条件边（required=0），
-                # 则重新评估所有条件边源的路由
+                # 从断点恢复：重建任务队列
+                # 保留每个任务的状态（pending/interrupted/completed），
+                # completed 的任务 Phase 2 跳过执行但 Phase 3 计入 barrier
                 is_resuming = True
-                final_nodes: list[str] = []
+                ready_tasks = []
                 for t in raw_pending:
                     node = t["node"]
+                    task_state = t.get("state", "pending")
                     rerouted = False
-                    # 检查 node 是否来自条件边（required=0 且有条件边指向它）
-                    for src, cond in self._conditional.items():
-                        # 用当前 state 重新算路由
-                        try:
-                            result = cond.path_fn(state)
-                            if cond.path_map and result in cond.path_map:
-                                result = cond.path_map[result]
-                        except Exception:
-                            continue
-                        # 如果 node 在这条条件边的"可达范围"内：
-                        # 即 src 有固定边到 node，或者 result 可能是 node
-                        # 简单判断：result == node → 不需要替换
-                        #             result != node → 如果 node 不是任何固定边目标，
-                        #                               说明 node 只能是条件边目标 → 替换
-                        if result == node or result == END:
-                            continue
-                        # node 是不是条件边目标？检查它是否不是固定边目标
-                        is_fixed_target = any(
-                            node in dsts for _s, dsts in self._adjacency.items()
-                            if _s == src
-                        )
-                        if not is_fixed_target:
-                            # node 来自条件边，路由结果变了
-                            if result not in final_nodes:
-                                final_nodes.append(result)
-                            rerouted = True
-                            break
-                    if not rerouted:
-                        if node not in final_nodes:
-                            final_nodes.append(node)
 
-                ready_tasks = [_Task(node=n) for n in final_nodes]
+                    # 只有 pending/interrupted 的节点需要重算条件边路由
+                    if task_state != "completed":
+                        for src, cond in self._conditional.items():
+                            try:
+                                result = cond.path_fn(state)
+                                if cond.path_map and result in cond.path_map:
+                                    result = cond.path_map[result]
+                            except Exception:
+                                continue
+                            if result == node or result == END:
+                                continue
+                            is_fixed_target = any(
+                                node in dsts for _s, dsts in self._adjacency.items()
+                                if _s == src
+                            )
+                            if not is_fixed_target:
+                                if not any(rt.node == result for rt in ready_tasks):
+                                    ready_tasks.append(_Task(node=result))
+                                rerouted = True
+                                break
+                    if not rerouted:
+                        if not any(rt.node == node for rt in ready_tasks):
+                            # 恢复时：completed 保持原样（Phase 2 跳过，Phase 3 计入 barrier）
+                            # 非 completed 一律设为 pending（需要执行）
+                            restored_state = (
+                                task_state if task_state == "completed"
+                                else "pending"
+                            )
+                            ready_tasks.append(_Task(node=node, state=restored_state))
             else:
                 # 已执行完毕（无 pending_tasks）→ 直接返回 state
                 yield ("value", state)
@@ -392,6 +391,7 @@ class CompiledGraph:
                         ctx.get("resume", [])[:ctx.get("interrupt_counter", 0)]
                     )
                     if thread_id:
+                        # 同波次所有任务都要存，否则恢复后扇出节点和 barrier 丢失
                         self._checkpointer.save(
                             thread_id, state,
                             metadata={
@@ -402,10 +402,15 @@ class CompiledGraph:
                                 "consumed_resumes": consumed,
                                 "pending_tasks": [
                                     {
-                                        "node": task.node,
-                                        "state": "pending",
-                                        "interrupt_value": gi.value,
-                                    },
+                                        "node": t.node,
+                                        "state": t.state,
+                                        **(
+                                            {"interrupt_value": gi.value}
+                                            if t is task
+                                            else {}
+                                        ),
+                                    }
+                                    for t in ready_tasks
                                 ],
                             },
                         )
@@ -471,8 +476,12 @@ class CompiledGraph:
             executed_nodes = {
                 t.node for t in ready_tasks if t.state == "completed"
             }
+            # 收集本波次实际执行的节点 + 跳过的 completed 节点（恢复时需要算后继）
+            nodes_for_next = {
+                node_name for node_name, _ in wave_updates
+            } | executed_nodes
             next_tasks: list[_Task] = []
-            for node_name, _ in wave_updates:
+            for node_name in nodes_for_next:
                 # 固定边后继（可能参与扇入 barrier）
                 fixed_succs = self._adjacency.get(node_name, [])
                 # 条件边后继（required=0，不受 barrier 限制）

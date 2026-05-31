@@ -504,3 +504,124 @@ class TestConcurrencySafety:
         # 图执行完毕，interrupt 应该报 RuntimeError
         with pytest.raises(RuntimeError, match="interrupt"):
             interrupt("不应被调用")
+
+
+class TestFanOutDynamicInterrupt:
+    """扇出 + 动态 interrupt：同波次其他节点不能丢。"""
+
+    def test_fan_out_sibling_not_lost_on_dynamic_interrupt(self):
+        """
+        a → [b(interrupt), c] → d
+        b 调用 interrupt()，c 还没执行。
+        恢复后 b 拿到 resume 值，c 也应该正常执行，最后到 d。
+        """
+        from simple_langgraph import StateGraph, START, END
+        from simple_langgraph.graph import interrupt, Command
+        from simple_langgraph.checkpoint import MemorySaver
+
+        call_log = []
+
+        def node_a(state):
+            call_log.append("a")
+            return {"x": 1}
+
+        def node_b(state):
+            call_log.append("b")
+            answer = interrupt("b needs input")
+            call_log.append(f"b_resume:{answer}")
+            return {"b_answer": answer}
+
+        def node_c(state):
+            call_log.append("c")
+            return {"y": 2}
+
+        def node_d(state):
+            call_log.append("d")
+            return {"done": True}
+
+        graph = StateGraph()
+        graph.add_node("a", node_a)
+        graph.add_node("b", node_b)
+        graph.add_node("c", node_c)
+        graph.add_node("d", node_d)
+        graph.add_edge(START, "a")
+        graph.add_edge("a", "b")
+        graph.add_edge("a", "c")
+        graph.add_edge("b", "d")
+        graph.add_edge("c", "d")
+
+        saver = MemorySaver()
+        compiled = graph.compile(checkpointer=saver)
+
+        # 第一次：a → c → b(interrupt)，c 在 b 之前执行了
+        r1 = compiled.invoke({}, config={"thread_id": "t1"})
+        assert "x" in r1  # a 执行了
+        assert "b_answer" not in r1  # b 被中断了，没完成
+
+        # 恢复：b 拿到 "yes"，c 已经跑过了，d 最后执行
+        call_log.clear()
+        r2 = compiled.invoke(Command(resume="yes"), config={"thread_id": "t1"})
+        assert r2 == {"x": 1, "b_answer": "yes", "y": 2, "done": True}
+        assert "b" in call_log    # b 重新执行
+        assert "d" in call_log    # d 最后执行
+
+    def test_fan_out_three_nodes_one_interrupts(self):
+        """
+        a → [b, c(interrupt), d] → e
+        c 调用 interrupt()，b 和 d 都还没执行完。
+        恢复后所有节点都应执行。
+        """
+        from simple_langgraph import StateGraph, START, END
+        from simple_langgraph.graph import interrupt, Command
+        from simple_langgraph.checkpoint import MemorySaver
+
+        call_log = []
+
+        def node_a(state):
+            call_log.append("a")
+            return {"x": 1}
+
+        def node_b(state):
+            call_log.append("b")
+            return {"y": 2}
+
+        def node_c(state):
+            call_log.append("c")
+            answer = interrupt("c needs input")
+            call_log.append(f"c_resume:{answer}")
+            return {"c_answer": answer}
+
+        def node_d(state):
+            call_log.append("d")
+            return {"z": 3}
+
+        def node_e(state):
+            call_log.append("e")
+            return {"done": True}
+
+        graph = StateGraph()
+        graph.add_node("a", node_a)
+        graph.add_node("b", node_b)
+        graph.add_node("c", node_c)
+        graph.add_node("d", node_d)
+        graph.add_node("e", node_e)
+        graph.add_edge(START, "a")
+        graph.add_edge("a", "b")
+        graph.add_edge("a", "c")
+        graph.add_edge("a", "d")
+        graph.add_edge("b", "e")
+        graph.add_edge("c", "e")
+        graph.add_edge("d", "e")
+
+        saver = MemorySaver()
+        compiled = graph.compile(checkpointer=saver)
+
+        r1 = compiled.invoke({}, config={"thread_id": "t1"})
+        assert "x" in r1  # a 执行了
+        assert "c_answer" not in r1  # c 被中断了
+
+        call_log.clear()
+        r2 = compiled.invoke(Command(resume="ok"), config={"thread_id": "t1"})
+        assert r2 == {"x": 1, "y": 2, "c_answer": "ok", "z": 3, "done": True}
+        assert "c" in call_log  # c 重新执行
+        assert "e" in call_log  # e 最后执行
