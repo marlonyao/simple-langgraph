@@ -6,6 +6,13 @@ from simple_langgraph.graph import (
     START,
     END,
     DEFAULT_MAX_ITERATIONS,
+    interrupt,
+    Command,
+    GraphInterrupt,
 )
 
-__all__ = ["StateGraph", "CompiledGraph", "START", "END", "DEFAULT_MAX_ITERATIONS"]
+__all__ = [
+    "StateGraph", "CompiledGraph", "START", "END",
+    "DEFAULT_MAX_ITERATIONS",
+    "interrupt", "Command", "GraphInterrupt",
+]

@@ -31,6 +31,59 @@ END = "__end__"
 DEFAULT_MAX_ITERATIONS = 100
 
 
+# ─── 动态 Interrupt 相关 ──────────────────────────────────────
+
+class GraphInterrupt(Exception):
+    """节点调用 interrupt() 时抛出的异常，用于暂停图执行。"""
+
+    def __init__(self, value: Any, node_name: str):
+        self.value = value
+        self.node_name = node_name
+        super().__init__(
+            f"Graph interrupted in node '{node_name}': {value!r}"
+        )
+
+
+class Command:
+    """恢复指令：invoke(Command(resume=value)) 传值给 interrupt()。"""
+
+    def __init__(self, *, resume: Any = None):
+        self.resume = resume
+
+
+# 执行上下文栈：interrupt() 通过它获取当前节点信息和 resume 值
+_exec_stack: list[dict[str, Any]] = []
+
+_SENTINEL = object()  # 标记"还没有 resume 值"
+
+
+def interrupt(value: Any) -> Any:
+    """
+    在节点内部调用，暂停图执行并传值给客户端。
+
+    首次调用：抛出 GraphInterrupt，value 存入 checkpoint。
+    恢复后重新执行节点时：返回 Command(resume=...) 传入的值。
+    """
+    if not _exec_stack:
+        raise RuntimeError(
+            "interrupt() can only be called inside a graph node"
+        )
+    ctx = _exec_stack[-1]
+
+    # 检查是否有 resume 值（恢复模式）
+    resume_list = ctx.get("resume", _SENTINEL)
+    if resume_list is not _SENTINEL:
+        # 有 resume 列表 → 按顺序消费
+        idx = ctx.get("interrupt_counter", 0)
+        if idx < len(resume_list):
+            ctx["interrupt_counter"] = idx + 1
+            return resume_list[idx]
+        # resume 值已全部消费，后续 interrupt 正常抛出
+
+    # 没有 resume → 抛出中断
+    raise GraphInterrupt(value, ctx["node"])
+
+
 # ─── 状态合并辅助 ───────────────────────────────────────────────
 def _merge_state(
     state: dict[str, Any],
@@ -116,12 +169,14 @@ class CompiledGraph:
 
     def invoke(
         self,
-        input: Optional[dict[str, Any]] = None,
+        input: Optional[dict[str, Any] | Command] = None,
         config: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """
         执行图：从 START 开始，沿边依次执行节点，直到到达 END 或断点。
         返回最终（或断点处的）state。
+
+        input 可以是 dict（正常输入）或 Command(resume=value)（恢复中断）。
         """
         final_state: dict[str, Any] = {}
         for event in self._run(input, config):
@@ -131,7 +186,7 @@ class CompiledGraph:
 
     def stream(
         self,
-        input: Optional[dict[str, Any]] = None,
+        input: Optional[dict[str, Any] | Command] = None,
         config: Optional[dict[str, Any]] = None,
         *,
         mode: str = "values",
@@ -142,6 +197,8 @@ class CompiledGraph:
         mode 参数：
         - "values": yield 完整 state 快照（默认）
         - "updates": yield {节点名: 节点返回的 updates}
+
+        input 可以是 dict 或 Command(resume=value)。
         """
         if mode not in ("values", "updates"):
             raise ValueError(
@@ -157,7 +214,7 @@ class CompiledGraph:
 
     def _run(
         self,
-        input: Optional[dict[str, Any]],
+        input: Optional[dict[str, Any] | Command],
         config: Optional[dict[str, Any]],
         yield_updates: bool = False,
     ) -> Generator[tuple, dict[str, Any], None]:
@@ -175,6 +232,12 @@ class CompiledGraph:
         - ("update", node_name, updates_dict) — 节点返回的增量
         """
         thread_id = self._get_thread_id(config)
+
+        # ── 解析 input ──
+        resume_value: Any = _SENTINEL
+        if isinstance(input, Command):
+            resume_value = input.resume
+            input = None  # Command 不是 dict input
 
         # ── 校验 ──
         if self._checkpointer and input is not None and not thread_id:
@@ -244,6 +307,15 @@ class CompiledGraph:
             raw_start = list(self._adjacency.get(START, []))
             ready_tasks = [_Task(node=n) for n in raw_start if n != END]
 
+        # ── 动态 interrupt 恢复准备 ──
+        # 如果是动态中断恢复，从 checkpoint metadata 读取已消费的 resume 列表
+        # 作为前缀传入，这样节点重新执行时 interrupt() 按顺序返回所有已确认的值
+        dynamic_resume_prefix: list[Any] = []
+        if is_resuming and loaded_cp:
+            cp_meta = loaded_cp["metadata"]
+            if cp_meta.get("interrupt") == "dynamic":
+                dynamic_resume_prefix = cp_meta.get("consumed_resumes", [])
+
         # ── 波次执行 ──
         barrier: dict[str, int] = {}
         iterations = 0
@@ -293,7 +365,53 @@ class CompiledGraph:
                     continue
 
                 node = self._nodes[task.node]
-                updates = node.action(state)
+
+                # 构建执行上下文（interrupt() 通过它获取信息）
+                ctx: dict[str, Any] = {"node": task.node}
+                if resume_value is not _SENTINEL:
+                    # 动态中断恢复：构建完整的 resume 列表
+                    # 前缀 = 之前已消费的值，新值追加到末尾
+                    ctx["resume"] = dynamic_resume_prefix + [resume_value]
+                    ctx["interrupt_counter"] = 0
+
+                _exec_stack.append(ctx)
+                try:
+                    updates = node.action(state)
+                except GraphInterrupt as gi:
+                    _exec_stack.pop()
+                    # 动态中断：保存 checkpoint
+                    if not self._checkpointer:
+                        raise RuntimeError(
+                            "interrupt() requires a checkpointer. "
+                            "Pass checkpointer= to compile()."
+                        )
+                    # 已消费的 resume 值（用于多次 interrupt 场景）
+                    consumed = list(
+                        ctx.get("resume", [])[:ctx.get("interrupt_counter", 0)]
+                    )
+                    if thread_id:
+                        self._checkpointer.save(
+                            thread_id, state,
+                            metadata={
+                                "node": task.node,
+                                "step": iterations,
+                                "interrupt": "dynamic",
+                                "interrupt_value": gi.value,
+                                "consumed_resumes": consumed,
+                                "pending_tasks": [
+                                    {
+                                        "node": task.node,
+                                        "state": "pending",
+                                        "interrupt_value": gi.value,
+                                    },
+                                ],
+                            },
+                        )
+                    yield ("value", state)
+                    return
+                finally:
+                    if _exec_stack and _exec_stack[-1] is ctx:
+                        _exec_stack.pop()
 
                 if yield_updates:
                     yield ("update", task.node, dict(updates))
